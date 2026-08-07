@@ -1,0 +1,30 @@
+# Goal-image conditioned policy on datasets from scripts/draw_simple/generate_simple_drawings.py
+# (the kinematic env/draw_simple env), where every demo of a task renders a bit-identical goal
+# image while stroke order and per-stroke pacing vary.
+#
+# Kept separate from draw_policy_dunet_goal_image.yaml so the published baselines on
+# datasets/draw/procedural_2000_10.zarr (experiments/draw_sim/baselines_and_ablations.sh) stay
+# reproducible -- the goal_image source below is a behavioural change, not a tuning knob.
+
+defaults:
+  - draw_policy_dunet_goal_image
+  # The goal_image key (drawing_image, not the last observation frame) and the goal rotation
+  # augmentation both live in task/draw_simple.yaml now, alongside the SimpleDrawRunner wiring.
+  - override /task: draw_simple
+  - _self_
+
+training:
+  # Off by default purely on cost: rollouts now WORK -- env_runner/draw_simple_runner.py drives the
+  # matching SimpleDrawEnv, so scores would measure policy quality rather than the sim2sim transfer
+  # the PD-controlled DrawEnv would have measured.
+  #
+  # -1 means env runners are never even constructed, and checkpoint.topk.monitor_key auto-falls
+  # back from eval_test_mean_score to val_action_mse_error_all -- which is why checkpoints from
+  # this config are named after the MSE.
+  #
+  # To select checkpoints on closed-loop score instead, set rollout_every to a positive number and
+  # task.eval_dataset_path to datasets/draw/simple_order_pacing_eval.zarr. Rollout cost is bounded
+  # by task.train_rollout_max_tasks / task.eval_rollout_max_tasks and
+  # training.rollout.intermediate_max_tasks. For evaluating an already-trained checkpoint, use
+  # draw_policy_dunet_goal_image_simple_rollout.yaml instead of changing this.
+  rollout_every: -1

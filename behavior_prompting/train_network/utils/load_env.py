@@ -11,6 +11,8 @@ from behavior_prompting.train_network.env.draw.draw_env import DrawEnv
 from behavior_prompting.train_network.env_runner.base_runner import BaseRunner
 from behavior_prompting.train_network.utils.dataset_util import prepare_only_task_names
 from behavior_prompting.train_network.env_runner.draw_runner import get_draw_env
+from behavior_prompting.train_network.env_runner.draw_simple_runner import get_simple_draw_env
+from behavior_prompting.train_network.env_runner.draw_dot_runner import get_dot_env
 from behavior_prompting.train_network.model.common.base_policy import BasePolicy
 from behavior_prompting.train_network.scripts.draw.demo_draw import collect_demos
 from accelerate import Accelerator
@@ -73,7 +75,27 @@ def aggregate_metrics(runner_log: Dict[str, Any], accelerator: Optional[Accelera
 
     new_metrics = _compute_mean_scores(merged_log, group_additional_categories)
     merged_log.update(new_metrics)
+    merged_log.update(_compute_mean_strategy_metrics(merged_log))
     return merged_log
+
+def _compute_mean_strategy_metrics(runner_log: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Average SimpleDrawRunner's per-task strategy metrics over tasks.
+
+    Keys look like "test/strategy/<task>/<metric>" and are aggregated to "strategy/test/<metric>".
+    Deliberately kept out of _compute_mean_scores: that function grabs every key containing
+    "mean_score", so naming these to fit it would fold strategy numbers into mean_scores/test/all
+    and corrupt the headline IoU. No other runner emits a "/strategy/" key, so this is inert
+    everywhere else.
+    """
+    by_metric: Dict[str, List[float]] = {}
+    for k, v in runner_log.items():
+        parts = k.split('/')
+        if len(parts) != 4 or parts[1] != 'strategy' or parts[0] not in ("train", "test"):
+            continue
+        if isinstance(v, (int, float)) and not np.isnan(v):
+            by_metric.setdefault(f"strategy/{parts[0]}/{parts[3]}", []).append(float(v))
+    return {k: float(np.mean(v)) for k, v in by_metric.items() if v}
 
 def _compute_mean_scores(runner_log: Dict[str, Any], group_additional_categories: Optional[List[str]]=None) -> Dict[str, Any]:
     """
@@ -169,16 +191,23 @@ def load_env_runner(cfg, output_dir, dataset: Optional[BaseDataset]=None, accele
         }
 
         return env_runners
-    elif cfg.task.name == "draw":
+    elif cfg.task.name in ("draw", "draw_simple", "draw_dot"):
         # for drawing task the number of env runners corresponds to the number of different tasks in the replay buffer. Thus we need to load the replay buffer and create an env runner for each task.
         # create a single set of drawing envs which is shared by all env runners (this is because all the envs are the same across letters and we can just update the target drawing for each task). This is more efficient than creating a new set of envs for each task.
         assert (cfg.task.dataset.dataset_path is not None or cfg.task.eval_dataset_path is not None) or cfg.task.live_demo, "either dataset path must be provided or live_demo must be true"
         assert not cfg.task.live_demo or (cfg.task.dataset.dataset_path is None and cfg.task.eval_dataset_path is None), "if live_demo set then dataset path and eval dataset path must both be None"
+        assert not (cfg.task.name == "draw_simple" and cfg.task.live_demo), (
+            "live_demo is not supported for draw_simple: scripts/draw/demo_draw.py::collect_demos is a "
+            "pygame loop built around DrawEnv's human render mode, which SimpleDrawEnv does not have.")
 
         if not cfg.task.live_demo:
             print (f"Creating drawing envs...")
             start_time = time.time()
-            env = get_draw_env(**cfg.task.env_runner)
+            env_factory = {
+                "draw_simple": get_simple_draw_env,
+                "draw_dot": get_dot_env,
+            }.get(cfg.task.name, get_draw_env)
+            env = env_factory(**cfg.task.env_runner)
             end_time = time.time()
             print(f"Time taken to create drawing envs: {end_time - start_time} seconds")
 
@@ -409,7 +438,7 @@ def env_rollout(cfg, env_runners, policy: Optional[BasePolicy]=None, enable_expe
         
         handle_runners(env_runners['seen'], need_to_init_runners=True, group_additional_categories=group_additional_categories)
         handle_runners(env_runners['unseen'], need_to_init_runners=True, aggregate_prefix='unseen', group_additional_categories=group_additional_categories)
-    elif cfg.task.name == "draw":
+    elif cfg.task.name in ("draw", "draw_simple", "draw_dot"):
         if cfg.task.live_demo:
             # TODO: move this functionality to a separate file
             # live demo mode requires user interaction and cannot work with multiple processes

@@ -1,0 +1,12 @@
+# @package _global_
+
+# Evaluate a trained DrawingDotEnv policy:
+#   python train.py --config-name=draw_dot_policy_dunet +rollout=draw_dot \
+#     'rollout.checkpoint_path="PATH/TO/epoch=0059-....ckpt"'
+#
+# ⚠️ Quote the checkpoint path: topk filenames contain '=', which Hydra's override grammar rejects
+# with a bare "mismatched input '='".
+
+defaults:
+  - base
+  - _self_

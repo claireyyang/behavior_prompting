@@ -1,0 +1,84 @@
+# Diffusion-UNet policy on DrawingDotEnv: dot-conditioned, delta actions.
+#
+#   accelerate launch --gpu_ids 0,1,2,3 --num_processes=4 train.py \
+#     --config-name=draw_dot_policy_dunet \
+#     task.dataset.dataset_path=datasets/draw_dot/dots_train.zarr \
+#     task.eval_dataset_path=datasets/draw_dot/dots_eval.zarr
+#
+# ⚠️ RolloutPolicyWorkspace rebuilds the model from THIS config rather than from the one stored
+# inside a checkpoint, so every model-shaping option has to match the training run. That is why they
+# are pinned here rather than passed as ad-hoc CLI overrides.
+
+defaults:
+  - policy_base
+  - task: draw_dot
+  - model: diffusion_unet
+  - _self_
+
+model:
+  obs_encoder:
+    # A ResNet, not the diffusion_unet default of vit_base_patch16_clip_224.
+    #
+    # Two reasons. The ViT is hard-wired to a 224x224 input and asserts on anything else, while this
+    # canvas is 96x96 -- upsampling 96 -> 224 would quadruple the pixels for no added information.
+    # And at ~86M parameters it is wildly oversized for a near-binary canvas showing a few dots and
+    # some ink; a ResNet is convolutional, so it takes 96px directly and trains far faster.
+    model_name: 'resnet34.a1_in1k'
+    # 96 / 16 -> a 6x6 feature map (feature_dim 256), rather than 32's 3x3.
+    downsample_ratio: 16
+    # Parameter-free aggregation. `TimmObsEncoder.get_optim_groups` asserts every encoder parameter
+    # belongs to the vision backbone, which the parameterised aggregations (attention_pool_2d,
+    # soft_attention, spatial_embedding, transformer) violate -- there is a TODO on that assert
+    # conceding it is wrong, but the draw configs never hit it because a ViT ignores
+    # feature_aggregation entirely and uses its CLS token. A global summary is therefore what the
+    # existing policies effectively use too; `dots` and `pen_pose` supply position explicitly.
+    feature_aggregation: 'avg'
+
+checkpoint:
+  save_last_ckpt: false
+  save_last_snapshot: false
+  topk:
+    # Falls back to test_mean_score (dot coverage) when no eval dataset is set; see
+    # train_policy_workspace's monitor_key resolution.
+    monitor_key: eval_test_mean_score
+    format_str: epoch={epoch:04d}-${.monitor_key}={${.monitor_key}:.3f}.ckpt
+    k: 1
+    mode: max
+  save_train_loss_ckpt_every: 5
+
+dataloader:
+  batch_size: 64
+  num_workers: 8
+  persistent_workers: true
+  pin_memory: true
+  shuffle: true
+
+val_dataloader:
+  batch_size: 64
+  num_workers: 8
+  persistent_workers: false
+  pin_memory: true
+  shuffle: false
+
+optimizer:
+  lr: 1.0e-4
+  betas: [0.95, 0.999]
+  eps: 1.0e-8
+  weight_decay: 1.0e-6
+
+training:
+  gradient_accumulate_every: 1
+  lr_scheduler: cosine
+  lr_warmup_proportion: 0.05
+  num_epochs: 60
+  rollout_every: 10
+  sample_every: 5
+  val_every: 5
+  use_ema: true
+  freeze_encoder: false
+  mixed_precision: 'no'
+  clip_grad_norm: 1.5
+  rollout:
+    # Rollouts are cheap here (96px canvas, ~60-step episodes), but they still scale with the
+    # instance count, so cap what runs mid-training.
+    intermediate_max_tasks: 10

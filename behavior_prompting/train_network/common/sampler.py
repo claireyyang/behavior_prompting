@@ -205,6 +205,17 @@ class SequenceSampler:
         key_horizon['action'] = shape_meta['action']['horizon']
         key_down_sample_steps['action'] = shape_meta['action']['down_sample_steps']
 
+        # How to fill the action horizon when an episode ends before it is full.
+        #   'repeat_last' (default) -- correct for ABSOLUTE actions: holding the last commanded pose
+        #                              keeps the agent where it finished.
+        #   'zeros'                 -- correct for DELTA actions, where repeating the last delta
+        #                              makes the agent keep moving forever instead of stopping.
+        # Defaulting to 'repeat_last' leaves every pre-existing task untouched.
+        self.action_padding_mode = shape_meta['action'].get('padding_mode', 'repeat_last')
+        assert self.action_padding_mode in ('repeat_last', 'zeros'), (
+            f"unknown action padding_mode {self.action_padding_mode!r}; "
+            f"expected 'repeat_last' or 'zeros'")
+
         # prediction horizon
         num_pred_steps = shape_meta['action']['horizon']
         
@@ -723,7 +734,13 @@ class SequenceSampler:
         if not use_action_padding_for_this_segment:
             assert output.shape[0] == action_horizon, 'a complete action horizon should have been available. This means that the setup indices for some reason allowed this index to be included even though we are not able to sample a full action horizon'
         elif output.shape[0] < action_horizon:
-            padding = np.repeat(output[-1:], action_horizon - output.shape[0], axis=0) # TODO: ideally each dataset should have it's own padding logic that is dependent on the action format as well as the action representation (delta vs absolute vs relative), but in practice just repeating the last action is probably fine
+            n_pad = action_horizon - output.shape[0]
+            if self.action_padding_mode == 'zeros':
+                # Delta actions: a zero delta means "hold position". Repeating the last delta would
+                # instead command the agent to keep drifting past the end of the episode.
+                padding = np.zeros((n_pad,) + output.shape[1:], dtype=output.dtype)
+            else:
+                padding = np.repeat(output[-1:], n_pad, axis=0)
             output = np.concatenate([output, padding], axis=0)
         result['action'] = output
 
@@ -1013,10 +1030,33 @@ class SequenceSampler:
         return output
     
     def _get_goal_image(self, segment_idx: int) -> np.ndarray:
-        """The goal image is the last image of the task in the replay buffer"""
+        """
+        The goal image is the last frame of the task in the replay buffer.
+
+        The goal image key may name either a `data` array or a `labels` array. Pointing it at a
+        label lets a dataset condition on a clean rendering of the target -- e.g. `drawing_image`,
+        which is ink only -- instead of the last observation frame, which also contains the agent
+        marker and therefore encodes where that particular demo happened to finish.
+        """
+        from_labels = self.goal_image_key not in self.replay_buffer.data
+        source = self.replay_buffer.labels if from_labels else self.replay_buffer.data
+        assert self.goal_image_key in source, (
+            f"goal image key '{self.goal_image_key}' is in neither replay_buffer.data "
+            f"({sorted(self.replay_buffer.data.keys())}) nor replay_buffer.labels "
+            f"({sorted(self.replay_buffer.labels.keys())})")
+
         if self.sample_type == 'task':
-            goal_image_frame_idx = self.replay_buffer.task_data_ends[segment_idx] - 1 # end of segment
+            # Labels and data are indexed in different spaces: `task_labels_ends` counts only steps
+            # covered by a task's labels, `task_data_ends` counts episode steps. They coincide only
+            # when each episode is exactly one task spanning the whole episode, so pick the right
+            # one rather than relying on that.
+            segment_ends = (self.replay_buffer.task_labels_ends if from_labels
+                            else self.replay_buffer.task_data_ends)
+            goal_image_frame_idx = segment_ends[segment_idx] - 1 # end of segment
             if self.replay_buffer.meta.get('goal_img_frame_idx') is not None:
+                assert not from_labels, (
+                    'goal_img_frame_idx indexes the data arrays, so it cannot be combined with a '
+                    'goal image key that resolves to a label')
                 meta_frame_idx = int(self.replay_buffer.meta['goal_img_frame_idx'][segment_idx])
                 # -1 means "invalid / use last frame of this segment"; otherwise use the stored frame index
                 assert meta_frame_idx >= 0, 'goal image frame index is invalid, update your dataset to either set a valid goal image frame index or remove this demonstration from your dataset. Segment index: {segment_idx}'
@@ -1024,8 +1064,12 @@ class SequenceSampler:
         else:
             assert self.sample_type == 'episode'
             assert self.replay_buffer.meta.get('goal_img_frame_idx') is None, 'goal image frame index is not yet supported for episode sampling'
+            assert not from_labels, (
+                'a labels-backed goal image key is only supported for task sampling, since episode '
+                'boundaries are recorded in the data index space')
             goal_image_frame_idx = self.replay_buffer.episode_ends[segment_idx] - 1 # end of episode
-        goal_image = self.replay_buffer.data[self.goal_image_key][goal_image_frame_idx]
+
+        goal_image = source[self.goal_image_key][goal_image_frame_idx]
         goal_image = np.expand_dims(goal_image, axis=0) # insert horizon dimension
         return goal_image
 

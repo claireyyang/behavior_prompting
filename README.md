@@ -16,6 +16,7 @@ This reposistory contains a number of useful components to aid with visuomotor p
 - **LIBERO** -- policy training and evaluation
 - **LIBERO-Gen** -- an extension to LIBERO that supports procedural generation of environments, tasks, and demonstrations automatically, including policy training, datasets, and evaluation
 - **DrawAnything-Sim** -- a simulation environment to evaluate 2D drawing capability, including policy training, datasets, and evaluation
+- **DrawAnything-Dots** -- the single-task / multi-manner counterpart to DrawAnything-Sim: one task (touch all the dots) demonstrated in four distinct manners, for measuring the residual multimodality a policy exhibits at fixed conditioning
 
 We take substantial care to make sure each component is cleanly and efficiently implemented and well documented.
 

@@ -24,6 +24,11 @@ from demo_draw import get_task_dataset_path
 
 # Import group_demos function
 from group_demos import group_demos
+
+# Per-demo strategy variation: stroke order, traversal direction, velocity profile, per-part
+# speed. See strategy_variation.py for why order/direction are image-invariant and
+# profile/per-part-speed are not.
+import strategy_variation as SV
 import warnings
 warnings.filterwarnings("ignore", message="missing object_codec for object array", category=FutureWarning) # we get warnings which interfere with the progress bar
 
@@ -769,12 +774,40 @@ def generate_single_task(args):
     Returns:
         tuple: (task_name, episode_count)
     """
-    # Unpack arguments
-    (output, task_idx, num_tasks, control_hz, board_length, margin, demos_per_task,
-     trajectory_speed_min, trajectory_speed_max,
-     noise_std, noise_bounds, min_parts, max_parts, visualize, viewer, verbose, base_seed,
-     positioning_steps_min, positioning_steps_max, offset_magnitude_factor, offset_magnitude_max, reward_threshold, connection_probability,
-     part_delay_min, part_delay_max, min_distance, oval_major_axis_min, oval_major_axis_max, partial_oval_probability, allowed_parts) = args
+    # Unpack arguments. This is a dict rather than a positional tuple: the tuple had grown to
+    # 30 entries that had to stay aligned across two construction sites, and the strategy-
+    # variation options below would have made it 37.
+    a = args
+    output = a['output']; task_idx = a['task_idx']; num_tasks = a['num_tasks']
+    control_hz = a['control_hz']; board_length = a['board_length']; margin = a['margin']
+    demos_per_task = a['demos_per_task']
+    trajectory_speed_min = a['trajectory_speed_min']; trajectory_speed_max = a['trajectory_speed_max']
+    noise_std = a['noise_std']; noise_bounds = a['noise_bounds']
+    min_parts = a['min_parts']; max_parts = a['max_parts']
+    visualize = a['visualize']; viewer = a['viewer']; verbose = a['verbose']
+    base_seed = a['base_seed']
+    positioning_steps_min = a['positioning_steps_min']; positioning_steps_max = a['positioning_steps_max']
+    offset_magnitude_factor = a['offset_magnitude_factor']; offset_magnitude_max = a['offset_magnitude_max']
+    reward_threshold = a['reward_threshold']; connection_probability = a['connection_probability']
+    part_delay_min = a['part_delay_min']; part_delay_max = a['part_delay_max']
+    min_distance = a['min_distance']
+    oval_major_axis_min = a['oval_major_axis_min']; oval_major_axis_max = a['oval_major_axis_max']
+    partial_oval_probability = a['partial_oval_probability']; allowed_parts = a['allowed_parts']
+
+    # --- strategy variation (per demo, within a task) ---
+    min_strokes = a.get('min_strokes', 1)
+    vary_order = a.get('vary_order', True)
+    vary_direction = a.get('vary_direction', True)
+    reverse_probability = a.get('reverse_probability', 0.5)
+    profile_families = a.get('profile_families', ('linear',))
+    profile_strength = a.get('profile_strength', 0.7)
+    profile_per_stroke = a.get('profile_per_stroke', False)
+    part_speed_ratio = a.get('part_speed_ratio', 1.0)
+    curvature_tol_px = a.get('curvature_tol_px', None)
+    settle_tolerance = a.get('settle_tolerance', 1.0)
+    settle_max_steps = a.get('settle_max_steps', 100)
+    settle_hold_steps = a.get('settle_hold_steps', 10)
+    final_hold_steps = a.get('final_hold_steps', 10)
 
     # Set numpy random seed for this task to ensure different random variations across processes
     task_seed = seed_from_ints([base_seed, task_idx, num_tasks])
@@ -796,16 +829,45 @@ def generate_single_task(args):
     render_mode = 'human' if viewer else 'rgb_array'
     env = DrawEnv(boundary_angle=0, render_mode=render_mode)
     
-    # Generate the procedural trajectory for this task (upright) - same for all demos
-    trajectory_control_points, start_pos_upright = generate_procedural_trajectory(
-        control_hz, board_length, margin, min_parts, max_parts, 
-        trajectory_speed_min=trajectory_speed_min, trajectory_speed_max=trajectory_speed_max,
-        connection_probability=connection_probability, min_distance=min_distance, 
-        oval_major_axis_min=oval_major_axis_min, oval_major_axis_max=oval_major_axis_max, 
-        partial_oval_probability=partial_oval_probability, allowed_parts=allowed_parts, verbose=verbose)
-    
+    # Generate the procedural trajectory for this task (upright) - the SHAPE, same for all demos.
+    # (The trajectory_speed_min/max kwargs that used to be passed here were never accepted by
+    # generate_procedural_trajectory and raised a TypeError; trajectory generation is
+    # speed-independent by design -- speed only enters when building actions.)
+    # Resample the shape until it has at least min_strokes strokes.
+    #
+    # Stroke count is 1 + the number of 'movement' parts, and movement is sampled per part, so
+    # nothing otherwise guarantees a multi-stroke task -- a task that lands on a single stroke has
+    # exactly one possible order and silently contributes no order variation at all. Retrying with
+    # a different seed is much simpler than biasing the part-type sampler.
+    max_shape_attempts = 50
+    for shape_attempt in range(max_shape_attempts):
+        np.random.seed(seed_from_ints([base_seed, task_idx, num_tasks, 'shape', shape_attempt]))
+        trajectory_control_points, start_pos_upright = generate_procedural_trajectory(
+            control_hz, board_length, margin, min_parts, max_parts,
+            connection_probability=connection_probability, min_distance=min_distance,
+            oval_major_axis_min=oval_major_axis_min, oval_major_axis_max=oval_major_axis_max,
+            partial_oval_probability=partial_oval_probability, allowed_parts=allowed_parts,
+            verbose=verbose)
+
+        # Group the chained parts into strokes. A stroke -- a maximal run of parts joined
+        # end-to-start -- is the unit of ordering, because parts inside a chain share endpoints and
+        # are one continuous pen-down run. Explicit 'movement' parts are dropped: pen-up bridges are
+        # regenerated per demo to connect whatever order was sampled.
+        task_strokes = SV.group_parts_into_strokes(trajectory_control_points)
+        if len(task_strokes) >= min_strokes:
+            break
+    else:
+        raise ValueError(
+            f"task {task_idx}: could not find a shape with >= {min_strokes} strokes in "
+            f"{max_shape_attempts} attempts. Stroke count is 1 + the number of 'movement' parts, so "
+            f"raise --max-parts or include 'movement' in --parts.")
+
     if verbose:
-        print(f"    Generated trajectory with {len(trajectory_control_points)} parts")
+        print(f"    Generated trajectory with {len(trajectory_control_points)} parts "
+              f"-> {len(task_strokes)} stroke(s) of {[len(s) for s in task_strokes]} parts")
+        if len(task_strokes) < 2 and vary_order:
+            print(f"    NOTE: single stroke, so order permutation is a no-op for this task. "
+                  f"Raise --min-parts or lower --connection-probability for multi-stroke shapes.")
     
     episode_count = 0
     first_demo_drawing_image = None
@@ -857,38 +919,84 @@ def generate_single_task(args):
             
             # Sample speeds for this demo (different from other demos in the same task)
             trajectory_speed = np.random.uniform(trajectory_speed_min, trajectory_speed_max)
-            
-            # Convert control points to actions at the sampled speed for this demo
-            trajectory_actions_upright, total_trajectory_steps = convert_control_points_to_actions(
-                trajectory_control_points, control_hz, trajectory_speed, noise_std, noise_bounds, board_length, margin,
-                offset_magnitude_factor, offset_magnitude_max,
-                part_delay_min, part_delay_max, min_distance)
-            
-            # Apply rotation transformation to the generated trajectory for this demo
-            center_x, center_y = 256.0, 256.0
-            rotated_actions = []
-            
-            for action in trajectory_actions_upright:
-                x, y, pen_down = action
-                
-                # Translate to origin
-                x_rel = x - center_x
-                y_rel = y - center_y
-                
-                # Apply rotation
-                cos_rot = np.cos(demo_rotation)
-                sin_rot = np.sin(demo_rotation)
-                x_rotated = x_rel * cos_rot - y_rel * sin_rot
-                y_rotated = x_rel * sin_rot + y_rel * cos_rot
-                
-                # Translate back
-                x_final = x_rotated + center_x
-                y_final = y_rotated + center_y
-                
-                rotated_actions.append(np.array([x_final, y_final, pen_down], dtype=np.float32))
-            
-            trajectory_actions = np.array(rotated_actions)
-            start_pos_rotated = np.array([trajectory_actions[0][0], trajectory_actions[0][1]])
+
+            # === sample this demo's STRATEGY: which order, which direction, what cadence ===
+            strategy = SV.sample_demo_strategy(
+                task_strokes, base_speed=trajectory_speed,
+                vary_order=vary_order, vary_direction=vary_direction,
+                profile_families=profile_families, profile_strength=profile_strength,
+                profile_per_stroke=profile_per_stroke, part_speed_ratio=part_speed_ratio,
+                reverse_probability=reverse_probability)
+            realized_strokes = SV.apply_strategy(task_strokes, strategy)
+
+            # The whole premise of the what/how split: permuting and reversing must not change
+            # a single pixel of commanded ink. Assert it per demo rather than trusting it.
+            SV.assert_geometry_preserved(task_strokes, realized_strokes)
+
+            # Build each stroke's actions independently (upright), then rotate.
+            def rotate_actions(actions, angle):
+                """Rotate (N,3) actions about the board centre, leaving pen_down alone."""
+                if len(actions) == 0:
+                    return np.zeros((0, 3), dtype=np.float32)
+                arr = np.asarray(actions, dtype=np.float64)
+                rel = arr[:, :2] - 256.0
+                c, s = np.cos(angle), np.sin(angle)
+                out = np.empty_like(arr)
+                out[:, 0] = rel[:, 0] * c - rel[:, 1] * s + 256.0
+                out[:, 1] = rel[:, 0] * s + rel[:, 1] * c + 256.0
+                out[:, 2] = arr[:, 2]
+                return out.astype(np.float32)
+
+            stroke_action_arrays = []
+            all_part_info = []
+            for exec_idx, stroke in enumerate(realized_strokes):
+                family, strength = strategy.profiles[exec_idx]
+                acts_upright, part_info = SV.build_stroke_actions(
+                    stroke, control_hz, strategy.base_speed,
+                    speed_mults=strategy.speed_mults[exec_idx],
+                    profile=(family, strength),
+                    noise_std=noise_std, noise_bounds=noise_bounds,
+                    part_delay_min=part_delay_min, part_delay_max=part_delay_max,
+                    curvature_tol_px=curvature_tol_px,
+                    # EVERY stroke gets a pen-down hold at its end, not just the last one:
+                    # the trail lags the command by ~0.2*v px, so lifting the pen at the
+                    # commanded end leaves that tail unpainted. Holding only the final stroke
+                    # made the render depend on which stroke was drawn last and on which end
+                    # each stroke finished at -- i.e. on the strategy.
+                    end_hold_steps=final_hold_steps)
+                stroke_action_arrays.append(rotate_actions(acts_upright, demo_rotation))
+                all_part_info.extend(part_info)
+
+            total_trajectory_steps = int(sum(len(a) for a in stroke_action_arrays))
+            if total_trajectory_steps == 0:
+                raise ValueError(f'demo {demo_idx} of {task_name} produced no actions')
+            start_pos_rotated = np.array([stroke_action_arrays[0][0][0],
+                                          stroke_action_arrays[0][0][1]])
+
+            # Label what actually happened, not what was commanded: the per-part sample-count
+            # floor means a short part at a high commanded speed saturates, and part length is a
+            # task property, so commanded speed carries geometry into the label.
+            realized_speeds = [pi['realized_speed'] for pi in all_part_info]
+            demo_realized_speed = float(np.mean(realized_speeds)) if realized_speeds else float('nan')
+            n_capped = int(sum(1 for pi in all_part_info if pi['was_capped']))
+            n_floored = int(sum(1 for pi in all_part_info if pi['was_floored']))
+            max_radial_error = float(max((pi['radial_error_px'] for pi in all_part_info), default=0.0))
+
+            # Per-demo strategy labels, broadcast per step like boundary_angle already is. These
+            # are what makes the strategy axis usable downstream -- for conditioning, for CFG, and
+            # for checking after the fact that the sampled strategies really do vary within a task.
+            # `strategy_max_radial_error_px` is the honest confound tracker: it is how far the
+            # achieved path can sit from the commanded path given this demo's speeds, i.e. how much
+            # this demo's 'how' could have leaked into its goal image.
+            strategy_labels = dict(strategy.summary_labels())
+            strategy_labels.update({
+                'strategy_realized_speed': demo_realized_speed,
+                'strategy_n_parts_capped': float(n_capped),
+                'strategy_n_parts_floored': float(n_floored),
+                'strategy_max_radial_error_px': max_radial_error,
+            })
+            for key in strategy_labels:
+                episode_labels.setdefault(key, [])
             
             # reset env and get observations
             env.seed(process_seed)  # Use deterministic seed based on task and demo
@@ -914,6 +1022,8 @@ def generate_single_task(args):
                 # store labels for this step
                 episode_labels['boundary_angle'].append(np.array(demo_rotation, dtype=np.float32))
                 episode_labels['drawing_image'].append(env.get_drawing_image())
+                for key, value in strategy_labels.items():
+                    episode_labels[key].append(np.array(value, dtype=np.float32))
                 
                 # step env and render
                 obs, reward, done, info = env.step(act)
@@ -923,74 +1033,75 @@ def generate_single_task(args):
                 if viewer:
                     pygame.time.wait(int(1000 / control_hz))
             
-            # Stage 1: Move cursor to starting position (pen up) using Bezier curve
-            if verbose:
-                print(f"    Moving cursor to starting position...")
-            
-            # Sample random number of positioning steps for this episode
-            num_positioning_steps = np.random.randint(positioning_steps_min, positioning_steps_max + 1)
-            
-            cursor_at_start = False
-            
-            # Generate Bezier curve control points for smooth positioning movement (once)
-            # Create control points that ensure smooth path from current to target
-            current_pos = np.array(obs['agent_pos'], dtype=np.float32)
-            
-            # Use shared helper function for smooth movement control points
-            control1, control2 = generate_movement_control_points(current_pos, start_pos_rotated, board_length, margin,
-                                                               offset_magnitude_factor, offset_magnitude_max)
-            
-            for positioning_step in range(num_positioning_steps):
-                # Get current cursor position
-                current_pos = np.array(obs['agent_pos'], dtype=np.float32)
-                
-                # Check if cursor is close enough to start position
-                distance_to_start = np.linalg.norm(current_pos - start_pos_rotated)
-                if verbose:
-                    print(f"    Distance to start: {distance_to_start:.1f}")
-                if distance_to_start < 5.0:  # Within 5 pixels
-                    cursor_at_start = True
-                    if verbose:
-                        print(f"    Cursor positioned at start (distance: {distance_to_start:.1f})")
-                    break
-                
-                # Calculate smooth progression along the Bezier curve
-                t = positioning_step / (num_positioning_steps - 1) if num_positioning_steps > 1 else 0
-                
-                # Use helper function for Bezier curve computation
-                target_pos = compute_bezier_point(current_pos, control1, control2, start_pos_rotated, t)
-                
-                # Move cursor towards target position (pen up)
-                act = np.array([target_pos[0], target_pos[1], 0.0], dtype=np.float32)
-                execute_step(act, "positioning")
+            def approach_and_settle(target_pos, n_steps, label=""):
+                """
+                Bring the cursor to target_pos with the pen UP and let it settle to rest.
 
-            # wait for cursor to reach start position
-            timeout_steps = 100
-            while not cursor_at_start:
+                Called before EVERY stroke, not just the first. This is what makes stroke-order
+                permutation image-invariant: the canvas records the agent's achieved position,
+                and the agent is a PD-tracked body, so a stroke entered with nonzero velocity is
+                rendered differently from the same stroke entered from rest. Previously
+                connected parts flowed into each other at speed; once strokes are reordered, a
+                stroke that used to be entered at speed may be entered from rest, which would
+                change its pixels and leak strategy into the goal image.
+                """
                 current_pos = np.array(obs['agent_pos'], dtype=np.float32)
-                distance_to_start = np.linalg.norm(current_pos - start_pos_rotated)
-                if verbose:
-                    print(f"    Distance to start: {distance_to_start:.1f}")
-                    print(f"    Cursor not at start (distance: {distance_to_start:.1f})")
-                if distance_to_start < 5.0:
-                    cursor_at_start = True
-                    if verbose:
-                        print(f"    Cursor positioned at start (distance: {distance_to_start:.1f})")
-                    break
-                act = np.array([start_pos_rotated[0], start_pos_rotated[1], 0.0], dtype=np.float32)
-                execute_step(act, "positioning")
-                timeout_steps -= 1
-                if timeout_steps <= 0:
-                    raise ValueError(f"Cursor positioning took too long")
-            
-            # Stage 2: Execute procedural trajectory (pen down)
+                control1, control2 = generate_movement_control_points(
+                    current_pos, target_pos, board_length, margin,
+                    offset_magnitude_factor, offset_magnitude_max)
+
+                for positioning_step in range(n_steps):
+                    current_pos = np.array(obs['agent_pos'], dtype=np.float32)
+                    if np.linalg.norm(current_pos - target_pos) < settle_tolerance:
+                        break
+                    t = positioning_step / (n_steps - 1) if n_steps > 1 else 0
+                    tp = compute_bezier_point(current_pos, control1, control2, target_pos, t)
+                    execute_step(np.array([tp[0], tp[1], 0.0], dtype=np.float32), label)
+
+                # Converge to the target, then keep holding it for a fixed number of extra steps.
+                #
+                # The extra hold is not belt-and-braces, it is required. Exiting as soon as the
+                # cursor is merely *within* settle_tolerance leaves it anywhere in that ball and
+                # still moving, and the approach Bezier is randomized per demo -- so the stroke
+                # would begin from a slightly different position and velocity every time. Against
+                # a 12 px pen that alone put a ~0.99 IoU noise floor under every render, even for
+                # two demos with identical strategies. Holding the exact target drives both the
+                # position error and the velocity to ~e^-N of their initial values, making the
+                # start of every stroke deterministic regardless of how the cursor got there.
+                arrived = False
+                for _ in range(settle_max_steps):
+                    current_pos = np.array(obs['agent_pos'], dtype=np.float32)
+                    if np.linalg.norm(current_pos - target_pos) < settle_tolerance:
+                        arrived = True
+                        break
+                    execute_step(np.array([target_pos[0], target_pos[1], 0.0], dtype=np.float32), label)
+
+                if not arrived:
+                    raise ValueError(
+                        f'cursor failed to settle at {target_pos} within {settle_max_steps} steps '
+                        f'(distance {np.linalg.norm(np.array(obs["agent_pos"]) - target_pos):.1f} px)')
+
+                for _ in range(settle_hold_steps):
+                    execute_step(np.array([target_pos[0], target_pos[1], 0.0], dtype=np.float32), label)
+
+            # Stage 1: approach the first stroke's start
             if verbose:
-                print(f"    Executing procedural trajectory at {trajectory_speed:.1f} px/s...")
-            
-            for step_idx in range(total_trajectory_steps):
-                # Get the pre-generated action for this step
-                act = trajectory_actions[step_idx]
-                execute_step(act, "trajectory")
+                print(f"    Executing {len(stroke_action_arrays)} stroke(s), "
+                      f"order={strategy.order}, reversed={strategy.reversed_flags}, "
+                      f"profile={strategy.profiles[0][0]}, base speed {trajectory_speed:.1f} px/s")
+
+            num_positioning_steps = np.random.randint(positioning_steps_min, positioning_steps_max + 1)
+            approach_and_settle(start_pos_rotated, num_positioning_steps, "positioning")
+
+            # Stage 2: draw each stroke, bridging between them with a pen-up settle
+            for exec_idx, stroke_actions in enumerate(stroke_action_arrays):
+                if exec_idx > 0:
+                    stroke_start = np.array([stroke_actions[0][0], stroke_actions[0][1]])
+                    bridge_steps = np.random.randint(positioning_steps_min, positioning_steps_max + 1)
+                    approach_and_settle(stroke_start, bridge_steps, "bridge")
+
+                for step_idx in range(len(stroke_actions)):
+                    execute_step(stroke_actions[step_idx], "trajectory")
             
             # Validate reward for episodes after the first (if they have a target drawing)
             if episode_count > 0 and first_demo_drawing_image is not None:
@@ -1079,7 +1190,12 @@ def generate_procedural_demos(output, control_hz=10, boundary_angle=None, persis
                             positioning_steps_min=20, positioning_steps_max=60,
                             offset_magnitude_factor=0.3, offset_magnitude_max=100.0, reward_threshold=-5.0, connection_probability=0.5,
                             part_delay_min=0, part_delay_max=10, min_distance=50.0,
-                            oval_major_axis_min=30.0, oval_major_axis_max=80.0, partial_oval_probability=0.0, allowed_parts=None):
+                            oval_major_axis_min=30.0, oval_major_axis_max=80.0, partial_oval_probability=0.0, allowed_parts=None,
+                            min_strokes=1, vary_order=True, vary_direction=True, reverse_probability=0.5,
+                            profile_families=('linear',), profile_strength=0.7, profile_per_stroke=False,
+                            part_speed_ratio=1.0, curvature_tol_px=None,
+                            settle_tolerance=1.0, settle_max_steps=100, settle_hold_steps=10,
+                            final_hold_steps=10):
     """
     Generate procedural drawing demonstrations using multiprocessing.
     
@@ -1190,17 +1306,42 @@ def generate_procedural_demos(output, control_hz=10, boundary_angle=None, persis
     
     start_time = time.time()
     
+    def build_task_args(task_idx, verbose_flag):
+        """One place that assembles a task's arguments, so the two call sites cannot drift."""
+        return {
+            'output': output, 'task_idx': task_idx, 'num_tasks': num_tasks,
+            'control_hz': control_hz, 'board_length': board_length, 'margin': margin,
+            'demos_per_task': demos_per_task,
+            'trajectory_speed_min': trajectory_speed_min, 'trajectory_speed_max': trajectory_speed_max,
+            'noise_std': noise_std, 'noise_bounds': noise_bounds,
+            'min_parts': min_parts, 'max_parts': max_parts,
+            'visualize': visualize, 'viewer': viewer, 'verbose': verbose_flag,
+            'base_seed': base_seed,
+            'positioning_steps_min': positioning_steps_min, 'positioning_steps_max': positioning_steps_max,
+            'offset_magnitude_factor': offset_magnitude_factor, 'offset_magnitude_max': offset_magnitude_max,
+            'reward_threshold': reward_threshold, 'connection_probability': connection_probability,
+            'part_delay_min': part_delay_min, 'part_delay_max': part_delay_max,
+            'min_distance': min_distance,
+            'oval_major_axis_min': oval_major_axis_min, 'oval_major_axis_max': oval_major_axis_max,
+            'partial_oval_probability': partial_oval_probability, 'allowed_parts': allowed_parts,
+            'min_strokes': min_strokes,
+            'vary_order': vary_order, 'vary_direction': vary_direction,
+            'reverse_probability': reverse_probability,
+            'profile_families': profile_families, 'profile_strength': profile_strength,
+            'profile_per_stroke': profile_per_stroke,
+            'part_speed_ratio': part_speed_ratio, 'curvature_tol_px': curvature_tol_px,
+            'settle_tolerance': settle_tolerance, 'settle_max_steps': settle_max_steps,
+            'settle_hold_steps': settle_hold_steps,
+            'final_hold_steps': final_hold_steps,
+        }
+
     if is_single_process:
         # Single-process execution - simpler and more verbose
         total_episodes = 0
         successful_tasks = 0
         
         for task_idx in tasks_to_generate:
-            args = (output, task_idx, num_tasks, control_hz, board_length, margin, demos_per_task,
-                   trajectory_speed_min, trajectory_speed_max,
-                   noise_std, noise_bounds, min_parts, max_parts, visualize, viewer, True, base_seed,
-                   positioning_steps_min, positioning_steps_max, offset_magnitude_factor, offset_magnitude_max, reward_threshold, connection_probability,
-                   part_delay_min, part_delay_max, min_distance, oval_major_axis_min, oval_major_axis_max, partial_oval_probability, allowed_parts)  # verbose=True for single process
+            args = build_task_args(task_idx, verbose_flag=True)  # verbose for single process
             task_name, episode_count = generate_single_task(args)
             successful_tasks += 1
             total_episodes += episode_count
@@ -1213,12 +1354,7 @@ def generate_procedural_demos(output, control_hz=10, boundary_angle=None, persis
         # Prepare arguments for missing tasks only
         task_args = []
         for task_idx in tasks_to_generate:
-            args = (output, task_idx, num_tasks, control_hz, board_length, margin, demos_per_task,
-                   trajectory_speed_min, trajectory_speed_max,
-                   noise_std, noise_bounds, min_parts, max_parts, visualize, viewer, False, base_seed,
-                   positioning_steps_min, positioning_steps_max, offset_magnitude_factor, offset_magnitude_max, reward_threshold, connection_probability,
-                   part_delay_min, part_delay_max, min_distance, oval_major_axis_min, oval_major_axis_max, partial_oval_probability, allowed_parts)  # verbose=False for multiprocessing
-            task_args.append(args)
+            task_args.append(build_task_args(task_idx, verbose_flag=False))
         
         # Use multiprocessing Pool for parallel task generation
         with Pool(processes=max_workers) as pool:
@@ -1448,7 +1584,7 @@ def get_completed_tasks(output, num_tasks, demos_per_task, check_videos=False, m
 @click.option('--offset-magnitude-max', default=100.0, type=float, help='Maximum offset magnitude in pixels for movement control points (default: 100.0).')
 @click.option('--reward-threshold', default=-10.0, type=float, help='Minimum acceptable reward threshold for drawing similarity (default: -5.0).')
 @click.option('--connection-probability', default=0.5, type=float, help='Probability that a new part connects to a previous part endpoint (default: 0.5).')
-@click.option('--part-delay-min', default=0, type=int, help='Minimum number of delay steps between trajectory parts (default: 0).')
+@click.option('--part-delay-min', default=0, type=int, help='Pen-down dwell steps at interior part boundaries. Measured to make almost no difference to render invariance (0.9535 -> 0.9543), so left at 0; the direction leak is driven by radial tracking error, not corners. Worth retesting once --curvature-tol-px bounds that error (default: 0).')
 @click.option('--part-delay-max', default=10, type=int, help='Maximum number of delay steps between trajectory parts (default: 10).')
 @click.option('--min-distance', default=50, type=float, help='Minimum distance between start and end positions for each trajectory part in pixels (default: 50).')
 @click.option('--oval-major-axis-min', default=30, type=float, help='Minimum major axis size for oval parts in pixels (default: 30).')
@@ -1459,13 +1595,29 @@ def get_completed_tasks(output, num_tasks, demos_per_task, check_videos=False, m
 @click.option('--vis-grouped-demos/--no-vis-grouped-demos', 'vis_grouped_demos', default=True, help='Create visualization grids (image and video) from grouped demos (default: True). Only used if group_demos_flag is True.')
 @click.option('--vis-max-videos', default=100, type=int, help='Maximum number of videos to use for visualization grids (default: 100).')
 @click.option('--vis-max-duration', default=60, type=float, help='Maximum duration in seconds for video grid (default: 60).')
+@click.option('--min-strokes', default=1, type=int, help='Resample a task shape until it has at least this many strokes. Order permutation needs >=2 to do anything, and a task that lands on 1 stroke silently contributes no order variation. 3 is a good target: 6 possible orders, and short enough episodes (default: 1).')
+@click.option('--vary-order/--no-vary-order', default=True, help='Permute stroke order per demo. Verified image-invariant: render IoU 1.0000 with 0 differing pixels. No-op for single-stroke tasks -- stroke count is 1 + the number of movement parts, so raise --max-parts to get multi-stroke shapes (default: True).')
+@click.option('--vary-direction/--no-vary-direction', default=False, help='Reverse stroke traversal per demo. OFF by default: measured NOT image-invariant -- render IoU drops to 0.84-0.97 because radial tracking error v^2/(R*k_p) has acceleration transients at a stroke ends that swap under reversal. Needs --curvature-tol-px and tighter oval eccentricity to be usable (default: False).')
+@click.option('--reverse-probability', default=0.5, type=float, help='Probability a given stroke is drawn backwards (default: 0.5).')
+@click.option('--profile-families', default='linear', help="Comma-separated velocity-profile families sampled per demo: linear,ease_in,ease_out,ease_in_out,two_peak. NOT image-invariant unless --curvature-tol-px is set (default: linear, i.e. off).")
+@click.option('--profile-strength', default=0.7, type=float, help='How far non-linear profiles depart from linear, 0-1 (default: 0.7).')
+@click.option('--profile-per-stroke/--profile-per-demo', default=False, help='Sample a profile per stroke rather than one per demo (default: per demo).')
+@click.option('--part-speed-ratio', default=1.0, type=float, help='Per-part speed multipliers sampled log-uniformly in [1/r, r]. 1.0 disables. NOT image-invariant unless --curvature-tol-px is set (default: 1.0).')
+@click.option('--curvature-tol-px', default=None, type=float, help='Cap each part at sqrt(tol*R*k_p) so the achieved path stays within tol px of the commanded path. REQUIRED for honest profile/per-part-speed variation; try 3.0. Note this caps tight arcs well below 100 px/s (default: None).')
+@click.option('--settle-tolerance', default=1.0, type=float, help='Pixel radius the cursor must reach before a stroke starts drawing. Tight by design: a loose ball lets each stroke start from a different point and velocity, which shows up in the render (default: 1.0).')
+@click.option('--settle-hold-steps', default=10, type=int, help='Extra steps holding the target after arriving, to zero out residual velocity so every stroke starts from an identical state. Required for order/direction to be image-invariant (default: 10).')
+@click.option('--settle-max-steps', default=100, type=int, help='Max steps to wait for the cursor to settle before each stroke (default: 100).')
+@click.option('--final-hold-steps', default=10, type=int, help='Steps to hold the final position at the end of an episode (default: 10).')
 def main_click(output, control_hz, boundary_angle, persistent, num_tasks, demos_per_task, 
                trajectory_speed_min, trajectory_speed_max, 
                margin, noise_std, noise_bounds, min_parts, max_parts, overwrite, visualize, viewer, max_workers, base_seed,
                positioning_steps_min, positioning_steps_max, offset_magnitude_factor, offset_magnitude_max, reward_threshold,
                connection_probability, part_delay_min, part_delay_max, min_distance,
                oval_major_axis_min, oval_major_axis_max, partial_oval_probability, parts, group_demos_flag, vis_grouped_demos,
-               vis_max_videos, vis_max_duration):
+               vis_max_videos, vis_max_duration,
+               min_strokes, vary_order, vary_direction, reverse_probability, profile_families, profile_strength,
+               profile_per_stroke, part_speed_ratio, curvature_tol_px,
+               settle_tolerance, settle_max_steps, settle_hold_steps, final_hold_steps):
     """
     Procedurally generate drawing data for the Draw task using behavior_prompting replay buffer format.
     
@@ -1602,6 +1754,33 @@ def main_click(output, control_hz, boundary_angle, persistent, num_tasks, demos_
     else:
         print("Using all part types: straight, curve, oval, movement")
 
+    # Parse and validate velocity-profile families
+    parsed_profile_families = tuple(f.strip() for f in profile_families.split(',') if f.strip())
+    for fam in parsed_profile_families:
+        if fam not in SV.PROFILE_FAMILIES:
+            raise click.ClickException(
+                f"Invalid profile family '{fam}'. Valid families are: {list(SV.PROFILE_FAMILIES)}")
+        if not SV.profile_is_monotone(fam, profile_strength):
+            raise click.ClickException(
+                f"Profile family '{fam}' is not monotone at strength {profile_strength}; it would "
+                f"reorder samples and change the drawn geometry.")
+
+    varies_speed = (parsed_profile_families != ('linear',)) or (part_speed_ratio > 1.0)
+    if varies_speed and curvature_tol_px is None:
+        print("\nWARNING: velocity-profile and/or per-part-speed variation is enabled without")
+        print("--curvature-tol-px. These axes are NOT image-invariant: the canvas records the")
+        print("agent's ACHIEVED position, and tracking a curve of radius R at speed v leaves the")
+        print("achieved path off the commanded path by about v^2/(R*k_p) -- e.g. 51 px on an")
+        print("R=11 arc at 200 px/s, against a 12 px pen. Demos of the same task will render")
+        print("DIFFERENT drawings, so the goal image will partially reveal the strategy and the")
+        print("what/how split you are trying to measure will leak. Pass --curvature-tol-px 3.0")
+        print("to bound it, and check the result with verify_strategy_invariance.py.\n")
+
+    if vary_order and max_parts <= 1:
+        print("\nWARNING: --vary-order with --max-parts 1 does nothing: order permutation needs")
+        print("multiple disconnected strokes. Raise --max-parts and/or lower")
+        print("--connection-probability so tasks contain several strokes.\n")
+
     start_time = time.time()
     
     generate_procedural_demos(output, control_hz=control_hz, boundary_angle=boundary_angle, 
@@ -1619,7 +1798,15 @@ def main_click(output, control_hz, boundary_angle, persistent, num_tasks, demos_
                             part_delay_min=part_delay_min, part_delay_max=part_delay_max,
                             min_distance=min_distance,
                             oval_major_axis_min=oval_major_axis_min, oval_major_axis_max=oval_major_axis_max,
-                            partial_oval_probability=partial_oval_probability, allowed_parts=allowed_parts)
+                            partial_oval_probability=partial_oval_probability, allowed_parts=allowed_parts,
+                            min_strokes=min_strokes,
+                            vary_order=vary_order, vary_direction=vary_direction,
+                            reverse_probability=reverse_probability,
+                            profile_families=parsed_profile_families, profile_strength=profile_strength,
+                            profile_per_stroke=profile_per_stroke, part_speed_ratio=part_speed_ratio,
+                            curvature_tol_px=curvature_tol_px,
+                            settle_tolerance=settle_tolerance, settle_max_steps=settle_max_steps,
+                            settle_hold_steps=settle_hold_steps, final_hold_steps=final_hold_steps)
     
     # Optionally group all demos into a single zarr.zip file
     if group_demos_flag:

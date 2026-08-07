@@ -17,14 +17,49 @@ from behavior_prompting.common.imagecodecs_numcodecs import register_codecs, Jpe
 from behavior_prompting.scripts.video_grid_from_videos import create_video_grid
 from behavior_prompting.scripts.image_grid_from_videos import create_image_grid
 
+# Image-valued labels are rebuilt as JpegXl arrays during the merge rather than copied episode by
+# episode, so they must not also be passed through as ordinary labels.
+IMAGE_LABEL_KEYS = ('drawing_image', 'goal_image')
+
+
+def expand_numeric_range(start: str, end: str) -> Optional[List[str]]:
+    """
+    Expand a numeric range like ('simple_0001', 'simple_1800') into every name between the two,
+    preserving zero padding: ['simple_0001', 'simple_0002', ..., 'simple_1800'].
+
+    Returns None when the pair is not a numeric range, so the caller can fall back to treating
+    the two sides as literal task names.
+
+    Both sides must share the same non-digit prefix and end in digit runs of the SAME width.
+    Requiring equal width keeps the padding unambiguous, which matters because the names have to
+    match zero-padded task directories like `draw_simple_0001_lower.zarr` exactly.
+    """
+    m_start = re.fullmatch(r'(.*?)(\d+)', start)
+    m_end = re.fullmatch(r'(.*?)(\d+)', end)
+    if m_start is None or m_end is None:
+        return None
+
+    prefix, lo_digits = m_start.groups()
+    end_prefix, hi_digits = m_end.groups()
+    if end_prefix != prefix or len(lo_digits) != len(hi_digits):
+        return None
+
+    lo, hi = int(lo_digits), int(hi_digits)
+    if lo > hi:
+        lo, hi = hi, lo
+    width = len(lo_digits)
+    return [f'{prefix}{i:0{width}d}' for i in range(lo, hi + 1)]
+
+
 def parse_task_patterns(patterns: str) -> Set[str]:
     """
     Parse task patterns and expand them to a set of task names.
-    
+
     Examples:
     - "A,B,C" -> {"draw_A", "draw_B", "draw_C"}
     - "A,B-P,Q" -> {"draw_A", "draw_B", "draw_C", ..., "draw_P", "draw_Q"}
     - "circle,square,triangle" -> {"draw_circle", "draw_square", "draw_triangle"}
+    - "simple_0001-simple_1800" -> {"draw_simple_0001", ..., "draw_simple_1800"}
     """
     task_names = set()
     
@@ -51,8 +86,14 @@ def parse_task_patterns(patterns: str) -> Set[str]:
                 for i in range(start_ord, end_ord + 1):
                     letter = chr(i)
                     task_names.add(f"draw_{letter}")
+            elif (numeric := expand_numeric_range(start, end)) is not None:
+                # Numeric range like "simple_0001-simple_1800". Without this branch it would fall
+                # through to the literal case below and silently select just the two endpoints --
+                # 2 tasks instead of 1800, with no error and nothing but a wrong task count to
+                # show for it.
+                task_names.update(f"draw_{name}" for name in numeric)
             else:
-                # Not a letter range, treat as literal
+                # Not a letter or numeric range, treat as literal
                 task_names.add(f"draw_{start}")
                 task_names.add(f"draw_{end}")
         else:
@@ -157,13 +198,27 @@ def merge_replay_buffers(datasets: List[str], output_path: str, num_workers: int
         for task_name in task_names:
             assert task_names[0] == task_name, f"Task names are not the same: {task_names[0]} != {task_name}"
 
+        # Carry through every scalar label the source buffer has, not just boundary_angle. The
+        # newer draw_simple generator also writes per-step `stroke_index` / `profile_id` and the
+        # per-demo `strategy_*` scalars; those are inert for policy training (DrawImageDataset
+        # never sets include_labels, so the sampler reads no labels at all) but they are the ground
+        # truth for a downstream strategy classifier, and dropping them here would mean
+        # regenerating the whole dataset to get them back.
+        #
+        # The image-valued labels are excluded deliberately: `drawing_image` is created separately
+        # below as a JpegXl array via require_dataset and streamed in by video_to_zarr, so passing
+        # it here would have add_episode create an uncompressed labels/drawing_image first and
+        # collide. `goal_image`, where present, is redundant with drawing_image.
+        passthrough_labels_keys = [k for k in replay_buffer.labels.keys()
+                                   if k not in IMAGE_LABEL_KEYS]
+
         # Process episodes with progress bar
-        for episode_idx in tqdm(range(replay_buffer.n_episodes), 
-                               desc=f"Dataset {i+1}/{len(datasets)}: {os.path.basename(dataset_path)}", 
+        for episode_idx in tqdm(range(replay_buffer.n_episodes),
+                               desc=f"Dataset {i+1}/{len(datasets)}: {os.path.basename(dataset_path)}",
                                leave=False):
             # Get episode data
-            episode_data = replay_buffer.get_episode(episode_idx, data_keys=['agent_pos', 'pen_down', 'action'], labels_keys=['boundary_angle'])
-            
+            episode_data = replay_buffer.get_episode(episode_idx, data_keys=['agent_pos', 'pen_down', 'action'], labels_keys=passthrough_labels_keys)
+
             # Add to merged buffer
             # we use compression here because we want to reduce the size of the replay buffer and don't care about compression time right now
             out_replay_buffer.add_episode(**episode_data, compressors=compressors)
@@ -330,11 +385,30 @@ def group_demos(input_dirs: List[str],
     else:
         print(f"Parsing task patterns: {task_patterns}")
         target_task_names = parse_task_patterns(task_patterns)
-        print(f"Target task names: {sorted(target_task_names)}")
-    
+        sorted_targets = sorted(target_task_names)
+        if len(sorted_targets) <= 20:
+            print(f"Target task names: {sorted_targets}")
+        else:
+            print(f"Target task names: {len(sorted_targets)} tasks, "
+                  f"{sorted_targets[0]} .. {sorted_targets[-1]}")
+
     # Find matching datasets
     matching_datasets = find_matching_datasets(input_dirs, target_task_names)
-    
+
+    # Report requested tasks that have no dataset. A pattern that quietly resolves to fewer tasks
+    # than intended is the main failure mode of -t (see expand_numeric_range), and it is otherwise
+    # invisible until you notice a wrong task count in the merged output.
+    if target_task_names is not None:
+        found_task_names = {
+            extract_task_name_from_dataset(os.path.basename(p)[:-len('.zarr')])
+            for p in matching_datasets
+        }
+        missing = sorted(target_task_names - found_task_names)
+        if missing:
+            shown = missing if len(missing) <= 20 else missing[:20] + ['...']
+            print(f"WARNING: {len(missing)} of {len(target_task_names)} requested tasks have no "
+                  f"matching .zarr in {input_dirs}: {shown}")
+
     if not matching_datasets:
         print("No matching datasets found!")
         print(f"Available datasets in input directories:")

@@ -21,6 +21,30 @@ def get_range_normalizer_from_stat(stat, output_max=1, output_min=-1, range_eps=
         input_stats_dict=stat
     )
 
+def get_symmetric_range_normalizer_from_stat(stat, output_abs=1, range_eps=1e-7):
+    """
+    Scale to [-output_abs, output_abs] with **zero offset**, so 0 maps to 0.
+
+    For DELTA actions, prefer this over `get_range_normalizer_from_stat`. That one fits an offset
+    from the observed min/max, so a delta distribution that is merely slightly asymmetric (say
+    min=-0.008, max=+0.012) sends "hold still" to a nonzero normalized value. A diffusion policy's
+    prior is N(0, I), so zero-delta landing on zero is a real inductive bias worth keeping -- and
+    "hold still" is a common, meaningful action rather than an arbitrary point in the range.
+
+    The scale is set by the larger absolute extreme so the whole range still fits inside the box.
+    """
+    input_abs = np.maximum(np.abs(stat['min']), np.abs(stat['max']))
+    ignore_dim = input_abs < range_eps
+    input_abs[ignore_dim] = output_abs
+    scale = output_abs / input_abs
+    offset = np.zeros_like(scale)
+
+    return SingleFieldLinearNormalizer.create_manual(
+        scale=scale,
+        offset=offset,
+        input_stats_dict=stat
+    )
+
 def get_image_range_normalizer():
     scale = np.array([2], dtype=np.float32)
     offset = np.array([-1], dtype=np.float32)

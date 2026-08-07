@@ -1,0 +1,26 @@
+# Closed-loop evaluation of a goal-image policy trained with
+# draw_policy_dunet_goal_image_simple.yaml on datasets/draw/simple_order_pacing_train.zarr.
+#
+# Usage (see also config/rollout/draw.yaml):
+#   python train.py --config-name=draw_policy_dunet_goal_image_simple_rollout +rollout=draw \
+#     rollout.checkpoint_path=<path to .ckpt>
+#
+# ⚠️ RolloutPolicyWorkspace rebuilds the model from THIS config, not from the one stored inside the
+# checkpoint, so every model-shaping option has to match the training run. That is the reason this
+# file exists rather than a pile of CLI overrides: it inherits the same
+# draw_policy_dunet_goal_image + diffusion_unet stack the training config did.
+
+defaults:
+  - draw_policy_dunet_goal_image
+  - override /task: draw_simple
+  - _self_
+
+task:
+  # The 200 held-out TASKS (draw simple_1801..2000), split off at merge time by
+  # scripts/draw/group_demos.py. Unseen shapes, which is what a goal-conditioned policy is meant to
+  # generalise over -- distinct from dataset.val_ratio, which holds out demos of *seen* tasks.
+  #
+  # Set task.dataset.dataset_path to the training zarr as well to get seen-task rollouts
+  # (test_mean_score) alongside these (eval_test_mean_score); the gap between them is what
+  # separates generalisation from memorisation.
+  eval_dataset_path: datasets/draw/simple_order_pacing_eval.zarr

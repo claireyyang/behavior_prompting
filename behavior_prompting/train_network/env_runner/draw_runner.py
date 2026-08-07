@@ -38,6 +38,27 @@ def task_name_to_boundary_angle(task_name: str) -> float:
     t = (h % 1000000) / 1000000.0  # [0, 1)
     return BOUNDARY_ANGLE_LOW + t * (BOUNDARY_ANGLE_HIGH - BOUNDARY_ANGLE_LOW)
 
+class DrawEnvSetup:
+    """
+    Configures one base env for a rollout: board angle and the drawing to reproduce.
+
+    A class rather than a closure because the caller `dill.dumps` this to ship it to
+    `AsyncVectorEnv` workers. It must therefore hold only plain data -- capturing the runner would
+    drag its `ReplayBuffer` (and the zarr behind it) through pickle on every env init.
+    """
+
+    def __init__(self, target_drawing, target_boundary_angle, boundary_angle_from_task):
+        self.target_drawing = target_drawing
+        self.target_boundary_angle = target_boundary_angle
+        self.boundary_angle_from_task = boundary_angle_from_task
+
+    def __call__(self, base_env):
+        if self.boundary_angle_from_task is not None:
+            base_env.boundary_angle = self.boundary_angle_from_task
+            base_env.randomize_boundary_angle = False
+        base_env.set_target_drawing(self.target_drawing, self.target_boundary_angle)
+
+
 def get_draw_env(shape_meta, n_train, n_test, boundary_angle, fps, crf, exec_action_horizon, max_steps, draw_env=None, use_async_vector_env=True, overlay_action_cross=True, overlay_reward=True, overlay_target_drawing=True, render_cache_size=None, **kwargs):
     n_envs = n_train + n_test
     steps_per_render = 1
@@ -185,6 +206,22 @@ class DrawRunner(BaseRunner):
                 self.rgb_keys.append(key)
             elif shape_meta['obs'][key]['type'] == 'low_dim':
                 self.lowdim_keys.append(key)
+
+    def _make_env_setup(self, target_drawing, target_boundary_angle, boundary_angle_from_task):
+        """
+        Build the per-env configuration step, as a picklable object (it is dilled to the workers).
+
+        Override to drive a different drawing env; everything else in `run` is env-agnostic.
+        """
+        return DrawEnvSetup(target_drawing, target_boundary_angle, boundary_angle_from_task)
+
+    def _extra_log_data(self, env, n_inits: int) -> dict:
+        """
+        Extra metrics read off the envs after the rollout, keyed like the rest of `log_data`.
+
+        Called before the envs are reset, so per-episode state is still readable. Empty by default.
+        """
+        return dict()
 
     def run(self, policy: BasePolicy, enable_expensive_vis: bool=True):
         print(f"\n=== Started DrawRunner run for task \"{self.task_name}\" ===")
@@ -392,7 +429,9 @@ class DrawRunner(BaseRunner):
                 output_dir = self.output_dir
                 vis_task_name = self.vis_task_name
 
-                def init_fn(env, seed=seed, enable_render=enable_render, target_drawing=target_drawing, target_boundary_angle=target_boundary_angle, boundary_angle_from_task=boundary_angle_from_task):
+                env_setup = self._make_env_setup(target_drawing, target_boundary_angle, boundary_angle_from_task)
+
+                def init_fn(env, seed=seed, enable_render=enable_render, env_setup=env_setup):
                     # setup rendering
                     # video_wrapper
                     assert isinstance(env.env, VideoRecordingWrapper)
@@ -405,19 +444,14 @@ class DrawRunner(BaseRunner):
                         filename = str(filename)
                         env.env.file_path = filename
 
-                    if boundary_angle_from_task is not None:
-                        env.env.env.boundary_angle = boundary_angle_from_task
-                        env.env.env.randomize_boundary_angle = False
-
-                    # set target drawing
-                    env.env.env.set_target_drawing(target_drawing, target_boundary_angle)
+                    env_setup(env.env.env)
 
                     # TODO: for train environments theoretically we should set the board angle and cursor position to be from the start of a training demonstration
 
                     # set seed
                     assert isinstance(env, MultiStepWrapper)
                     env.seed(seed)
-                
+
                 env_seeds.append(seed)
                 env_prefixs.append(f'train/{self.vis_task_name}_')
                 env_init_fn_dills.append(dill.dumps(init_fn))
@@ -431,7 +465,9 @@ class DrawRunner(BaseRunner):
                 output_dir = self.output_dir
                 vis_task_name = self.vis_task_name
 
-                def init_fn(env, seed=seed, enable_render=enable_render, target_drawing=target_drawing, target_boundary_angle=target_boundary_angle, boundary_angle_from_task=boundary_angle_from_task):
+                env_setup = self._make_env_setup(target_drawing, target_boundary_angle, boundary_angle_from_task)
+
+                def init_fn(env, seed=seed, enable_render=enable_render, env_setup=env_setup):
                     # setup rendering
                     # video_wrapper
                     assert isinstance(env.env, VideoRecordingWrapper)
@@ -444,17 +480,12 @@ class DrawRunner(BaseRunner):
                         filename = str(filename)
                         env.env.file_path = filename
 
-                    if boundary_angle_from_task is not None:
-                        env.env.env.boundary_angle = boundary_angle_from_task
-                        env.env.env.randomize_boundary_angle = False
-
-                    # set target drawing
-                    env.env.env.set_target_drawing(target_drawing, target_boundary_angle)
+                    env_setup(env.env.env)
 
                     # set seed
                     assert isinstance(env, MultiStepWrapper)
                     env.seed(seed)
-                
+
                 env_seeds.append(seed)
                 env_prefixs.append(f'test/{self.vis_task_name}_')
                 env_init_fn_dills.append(dill.dumps(init_fn))
@@ -596,12 +627,16 @@ class DrawRunner(BaseRunner):
             if self.use_prompting and total_available_action_steps_after_prompting is not None and total_available_action_steps_after_prompting < self.max_steps:
                 assert policy.num_available_actions() < self.exec_action_horizon, 'if we are limited by the number of steps we can execute, then the number of steps we can execute should be less than the number of steps we can predict at the very end of execution'
 
+        # read anything a subclass needs off the envs while their episode state is still live --
+        # the reset below wipes it
+        extra_log_data = self._extra_log_data(env, n_inits)
+
         # clear out video buffer
         _ = env.reset()
         # clear out policy buffers
         policy.reset(action_exec_horizon=self.exec_action_horizon)
 
-        log_data = dict()
+        log_data = dict(extra_log_data)
         vis_demo_name = os.path.basename(all_video_paths[self.vis_env_index]).replace('.mp4', '')
 
         # TODO add visualization for goal image and rollout for goal image condition policy to verify that goal image orientation doesn't need to match rollout target drawing orientation

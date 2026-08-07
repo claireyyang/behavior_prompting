@@ -1,0 +1,124 @@
+# DrawingDotEnv: ONE task ("touch all the dots") with many INSTANCES (dot layouts), each
+# demonstrated in four distinct manners.
+#
+# This is the manner-diversity counterpart to task/draw.yaml's task-diversity setup. See
+# docs/drawanything_dots.md for why both exist.
+name: draw_dot
+
+obs_horizon: 2
+action_horizon: 16
+
+# Held-out INSTANCES, not held-out tasks -- this measures generalization across dot layouts.
+eval_dataset_path: null
+eval_rollout_only_task_names: null
+eval_rollout_max_tasks: null
+train_rollout_only_task_names: null
+train_rollout_max_tasks: 10
+
+live_demo: false # the Phase-2 ungrounded demo collector is a separate entry point, not this flag
+
+shape_meta: &shape_meta
+  image_resolution: 96
+  use_prompting: false
+  # Prompting is unused here (conditioning is the dot set itself); these exist because shared code
+  # paths read them.
+  prompt_sample_mode: pair
+  prompt_sequence_length: 1
+  sequence_prompting_min_steps_per_task: 1
+  max_prompt_full_demos: 1
+  prompt_chunk_n_actions: 1
+  pad_end_prompt_actions: 'no'
+  max_sequence_length: 256
+  action:
+    horizon: ${task.action_horizon}
+    down_sample_steps: 1
+    type: low_dim
+    shape: [3]  # dx, dy, dz -- DELTAS, stored natively in the zarr
+    # Zero-pad a short action horizon instead of repeating the last action. Repeating a final DELTA
+    # commands the pen to keep drifting past the end of the episode; a zero delta holds position.
+    padding_mode: zeros
+    components:
+      - type: delta_pos
+        size: 2
+      - type: delta_z
+        size: 1
+  obs:
+    # ch0 ink, ch1 dot discs, ch2 walls (all-zero until Phase 2). Three meaningful signals in the
+    # three channels a pretrained RGB encoder expects.
+    canvas:
+      horizon: ${task.obs_horizon}
+      down_sample_steps: 1
+      shape: [3, 96, 96]
+      type: rgb
+      prompt_type: observation
+      include_in_prompt_current_obs: true
+    # The task conditioning. Constant within an episode, hence horizon 1.
+    dots:
+      shape: [4, 2]
+      type: low_dim
+      horizon: 1
+      down_sample_steps: 1
+      prompt_type: ignore
+      include_in_prompt_current_obs: false
+    pen_pose:
+      shape: [3]
+      type: low_dim
+      horizon: ${task.obs_horizon}
+      down_sample_steps: 1
+      prompt_type: proprioception
+      include_in_prompt_current_obs: true
+
+env_runner:
+  _target_: behavior_prompting.train_network.env_runner.draw_dot_runner.DrawDotRunner
+  crf: 22
+  fps: 10
+  # Demos run ~50-100 steps; this is a comfortable ceiling without letting a stuck policy burn time.
+  max_steps: 200
+  n_test: 16
+  n_test_vis: 1
+  n_train: 8
+  n_train_vis: 1
+  train_start_seed: 0
+  test_start_seed: 10000
+  tqdm_interval_sec: 1.0
+  shape_meta: ${shape_meta}
+  exec_action_horizon: 8
+  canvas_size: 96
+  render_size: 256
+  # Multimodality is defined as variation at FIXED conditioning, so this pins the pen start as well
+  # as the dot set across all envs of an instance -- otherwise the spread conflates the policy's own
+  # multimodality with its sensitivity to initial conditions. Leave false for success-rate runs.
+  fix_initial_state: false
+  # Manner metrics are computed over rollouts that essentially finished the drawing; an unfinished
+  # one has a meaningless stroke structure.
+  strategy_coverage_threshold: 0.9
+
+# No augmentation. Cropping or colour-jittering would move the canvas relative to the dot
+# coordinates in `obs.dots` and change which manner a trajectory represents -- the one thing that
+# must stay labelled correctly. Resize to the declared resolution is a no-op passthrough.
+eval_image_transforms:
+  _target_: behavior_prompting.train_network.common.augmentation.ImageAugmentation
+  shape_meta: ${shape_meta}
+  transforms:
+    - _target_: torchvision.transforms.Resize
+      size: [96, 96]
+
+train_image_transforms:
+  _target_: behavior_prompting.train_network.common.augmentation.ImageAugmentation
+  shape_meta: ${shape_meta}
+  transforms:
+    - _target_: torchvision.transforms.Resize
+      size: [96, 96]
+
+dataset:
+  _target_: behavior_prompting.train_network.dataset.dot_dataset.DotDataset
+  dataset_path: null
+  shape_meta: ${shape_meta}
+  seed: 42
+  # Per-instance split: every instance contributes demos to both train and val.
+  val_ratio: 0.1
+  sample_type: task
+  max_segments: -1
+  action_padding: true
+  only_task_names: null
+  max_tasks: null
