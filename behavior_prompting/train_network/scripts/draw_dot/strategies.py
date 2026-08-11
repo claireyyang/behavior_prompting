@@ -40,7 +40,7 @@ from behavior_prompting.train_network.env.draw_dot.layout import (
 )
 
 __all__ = ['MANNERS', 'MANNER_TO_ID', 'Demo', 'make_demo', 'make_all',
-           'make_connect', 'make_touch', 'make_curve', 'make_parallel']
+           'make_connect', 'make_touch', 'make_curve', 'make_parallel', 'path_to_demo']
 
 Z_DOWN = 0.0
 Z_UP = 1.0
@@ -239,3 +239,51 @@ def make_all(layout: DotLayout, pen_start: np.ndarray,
              speed: float = DEFAULT_SPEED) -> Dict[str, Demo]:
     """All four manners for one instance, noiseless. Used by the separability check."""
     return {m: make_demo(m, layout, pen_start, speed) for m in MANNERS}
+
+
+def path_to_demo(xy_path: np.ndarray, z_path: np.ndarray, pen_start: np.ndarray,
+                 target_dot_index: Optional[np.ndarray] = None, manner: str = 'HUMAN',
+                 speed: float = DEFAULT_SPEED, min_step_frac: float = 0.25) -> Demo:
+    """
+    Turn an arbitrary absolute `(xy, z)` path into a `Demo`, for paths this module did not author.
+
+    This is the entry point for a **human** demonstration (see `scripts/draw_dot/collect_demo.py`).
+    It runs through the same `_Emitter` the four scripted manners use, which is the point: a captured
+    path comes out as an action stream structurally indistinguishable from a generated one -- same
+    speed limit, same delta convention, same dwell semantics -- so nothing downstream needs to know
+    which kind it is looking at.
+
+    Two things happen on the way in.
+
+    **Decimation.** A mouse is sampled tens of times a second and mostly does not move. A sample is
+    dropped unless it either moved at least `min_step_frac * speed` or changed the pen state; without
+    this, a few seconds of capture becomes thousands of near-zero actions. Contact transitions are
+    never dropped, because the pen state is the entire content of two of the four manners.
+
+    **Re-timing, not re-shaping.** `_Emitter.goto` walks toward each surviving sample in `speed`-sized
+    hops, so hand speed is discarded and the geometry is kept exactly. That is the right trade here:
+    all four scripted manners are generated at one constant `DEFAULT_SPEED`, so pacing carries no
+    manner information in this dataset, while shape and contact carry all of it. A caller that wants
+    the human's pacing should keep the raw path -- `collect_demo` saves it alongside.
+    """
+    xy = np.asarray(xy_path, dtype=np.float64).reshape(-1, 2)
+    z = np.asarray(z_path, dtype=np.float64).reshape(-1)
+    assert len(xy) == len(z) and len(xy) > 0, 'xy_path and z_path must be non-empty and same length'
+
+    min_step = float(min_step_frac) * float(speed)
+    keep = [0]
+    for i in range(1, len(xy)):
+        moved = float(np.linalg.norm(xy[i] - xy[keep[-1]]))
+        if z[i] != z[keep[-1]] or moved >= min_step:
+            keep.append(i)
+    xy, z = xy[keep], z[keep]
+
+    if target_dot_index is None:
+        targets = np.zeros(len(xy), dtype=np.int64)
+    else:
+        targets = np.asarray(target_dot_index, dtype=np.int64).reshape(-1)[keep]
+
+    e = _Emitter(pen_start, speed)
+    for p, zi, idx in zip(xy, z, targets):
+        e.goto(p, float(zi), int(idx))
+    return e.finish(manner, pen_start)

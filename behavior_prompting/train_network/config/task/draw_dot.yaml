@@ -85,6 +85,12 @@ env_runner:
   exec_action_horizon: 8
   canvas_size: 96
   render_size: 256
+  # What observation channel 0 shows. true = accumulated ink, which is the action history rendered
+  # and is the only thing carrying a manner across action chunks (the policy is stateless between
+  # them). false = discs at the dots already touched: same task progress, no trajectory, so a manner
+  # cannot persist through the observation. MUST match the dataset -- generate_dot_demos.py records
+  # whatever the env emits, so a policy trained on one setting is meaningless under the other.
+  observe_ink: true
   # Multimodality is defined as variation at FIXED conditioning, so this pins the pen start as well
   # as the dot set across all envs of an instance -- otherwise the spread conflates the policy's own
   # multimodality with its sensitivity to initial conditions. Leave false for success-rate runs.

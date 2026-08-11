@@ -64,6 +64,7 @@ from behavior_prompting.train_network.env.draw_dot.layout import (
 )
 from behavior_prompting.train_network.gym_util.multistep_wrapper import stack_last_n_obs
 from behavior_prompting.train_network.model.common.base_policy import BasePolicy
+from behavior_prompting.train_network.scripts.draw_dot.collect_demo import collect_demo
 from behavior_prompting.train_network.utils import dot_strategy_metrics as DM
 
 REPO_TRAIN_NETWORK = pathlib.Path(__file__).resolve().parents[2]
@@ -72,8 +73,11 @@ DEFAULT_CKPT = REPO_TRAIN_NETWORK / (
 
 # What `LiveViewer.show` reports back to the rollout loop.
 CMD_GO, CMD_PAUSE, CMD_NEXT, CMD_REPLAY, CMD_QUIT = 'go', 'pause', 'next', 'replay', 'quit'
+CMD_DEMO = 'demo'
 _KEYMAP = {ord('q'): CMD_QUIT, 27: CMD_QUIT, ord('n'): CMD_NEXT,
-           ord('r'): CMD_REPLAY, ord(' '): CMD_PAUSE}
+           ord('r'): CMD_REPLAY, ord(' '): CMD_PAUSE, ord('d'): CMD_DEMO}
+# Commands that abandon the current episode rather than letting it finish.
+_ABANDON = (CMD_QUIT, CMD_NEXT, CMD_REPLAY, CMD_DEMO)
 
 
 # ---------------------------------------------------------------------------------------
@@ -165,7 +169,7 @@ class LiveViewer:
         hud = list(hud_lines) + ['[PAUSED - space to resume]']
         while True:
             cmd = self.show(env, hud, delay_ms=50)
-            if cmd in (CMD_PAUSE, CMD_NEXT, CMD_REPLAY, CMD_QUIT):
+            if cmd == CMD_PAUSE or cmd in _ABANDON:
                 return CMD_GO if cmd == CMD_PAUSE else cmd
 
     def close(self):
@@ -214,7 +218,7 @@ def run_episode(policy: BasePolicy, env: DrawingDotEnv, layout: DotLayout,
             cmd = viewer.show(env, hud)
             if cmd == CMD_PAUSE:
                 cmd = viewer.wait_while_paused(env, hud)
-            if cmd in (CMD_QUIT, CMD_NEXT, CMD_REPLAY):
+            if cmd in _ABANDON:
                 return cmd, None
 
     # Score from terminal state, before anything resets it -- see `DrawDotRunner`'s docstring on
@@ -258,6 +262,13 @@ def print_histogram(results: Sequence[DM.RolloutResult], threshold: float) -> No
 # main
 # ---------------------------------------------------------------------------------------
 
+def next_demo_index(demo_dir: str) -> int:
+    """Continue the filename numbering already in `demo_dir` instead of overwriting."""
+    d = pathlib.Path(demo_dir)
+    existing = sorted(d.glob('demo_*.npz')) if d.is_dir() else []
+    return 1 + max((int(f.name.split('_')[1]) for f in existing), default=-1)
+
+
 def select_instances(replay_buffer: ReplayBuffer, args) -> List[str]:
     names = list_instance_names(replay_buffer)
     if args.instances:
@@ -293,6 +304,10 @@ def parse_args(argv=None):
     p.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     p.add_argument('--coverage-threshold', type=float, default=DM.DEFAULT_COVERAGE_THRESHOLD)
     p.add_argument('--no-window', action='store_true', help='headless; print only')
+    p.add_argument('--demo-dir', default='demos/draw_dot',
+                   help="where the 'd' key writes human manner demonstrations")
+    p.add_argument('--demo-seed', type=int, default=None,
+                   help='seeds the demo layout sampling; defaults to --seed + 1')
     return p.parse_args(argv)
 
 
@@ -317,9 +332,17 @@ def main(argv=None) -> int:
           f'{"fixed" if args.fix_initial_state else "resampled"} pen start, '
           f'{max_steps} steps, exec horizon {exec_horizon}')
 
-    env = DrawingDotEnv(canvas_size=int(er.canvas_size), render_size=render_size)
+    # Read from the checkpoint's own cfg, never from a CLI default: a policy trained on visited-dot
+    # observations rolled out against ink observations would silently produce nonsense.
+    observe_ink = bool(er.get('observe_ink', True))
+    print(f'observation channel 0: {"ink (action history)" if observe_ink else "visited dots"}')
+    env = DrawingDotEnv(canvas_size=int(er.canvas_size), render_size=render_size,
+                        observe_ink=observe_ink)
     viewer = LiveViewer(scale=args.scale, delay_ms=round(1000 / fps), enabled=not args.no_window)
     rng = np.random.default_rng(args.seed)
+    # A separate stream from `rng` so that pressing `d` does not shift the pen starts that
+    # subsequent episodes would otherwise have drawn.
+    demo_rng = np.random.default_rng(args.seed + 1 if args.demo_seed is None else args.demo_seed)
     torch.manual_seed(args.seed)
 
     all_results: List[DM.RolloutResult] = []
@@ -336,7 +359,7 @@ def main(argv=None) -> int:
                            f'(total {len(all_results)})',
                            DM.summarize(all_results, args.coverage_threshold)
                            if all_results else 'no results yet',
-                           'n=next  r=replay  space=pause  q=quit']
+                           'n=next  r=replay  d=demonstrate  space=pause  q=quit']
                     # Sampling noise is drawn fresh inside predict_action on every call, so a
                     # replay at the same conditioning is simply another draw from p(tau | goal).
                     cmd, result = run_episode(policy, env, layout, pen_start, obs_horizons,
@@ -344,6 +367,16 @@ def main(argv=None) -> int:
                     if cmd == CMD_QUIT:
                         quit_requested = True
                         break
+                    if cmd == CMD_DEMO:
+                        # The demo layout is deliberately unrelated to `name`: what should transfer
+                        # is the manner, not a solution to this instance.
+                        print(f'\n--- demonstrating a manner (target instance: {name}) ---')
+                        written = collect_demo(args.demo_dir, demo_rng,
+                                              canvas_size=int(er.canvas_size),
+                                              render_size=render_size, scale=args.scale,
+                                              start_index=next_demo_index(args.demo_dir))
+                        print(f'--- {len(written)} demo(s) saved, resuming rollouts ---\n')
+                        continue
                     if cmd == CMD_REPLAY:
                         continue
                     if cmd == CMD_NEXT:

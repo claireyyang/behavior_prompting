@@ -54,6 +54,7 @@ from behavior_prompting.train_network.env.draw_dot.layout import (
     sample_layout,
     sample_pen_start,
     to_px,
+    visited_mask,
 )
 
 PEN_DOWN_Z = 0.5
@@ -69,6 +70,8 @@ class DrawingDotEnv(gym.Env):
         dot_radius: contact radius; the pen must be within this of a dot, pen down, to touch it.
         ink_tol_px: dilation of the allowed-ink region when scoring precision.
         render_size: side length of the human/video render.
+        observe_ink: what channel 0 of the `canvas` observation shows. See below -- this changes
+            what the policy can know, so a dataset and the policy trained on it must agree.
     """
 
     metadata = {'render.modes': ['human', 'rgb_array'], 'video.frames_per_second': 10}
@@ -83,8 +86,10 @@ class DrawingDotEnv(gym.Env):
                  pen_radius_px: int = PEN_RADIUS_PX,
                  ink_tol_px: int = 3,
                  render_size: int = 256,
-                 render_mode: str = 'rgb_array'):
+                 render_mode: str = 'rgb_array',
+                 observe_ink: bool = True):
         self.canvas_size = int(canvas_size)
+        self.observe_ink = bool(observe_ink)
         self.max_delta = float(max_delta)
         self.max_delta_z = float(max_delta_z)
         self.dot_radius = float(dot_radius)
@@ -264,7 +269,35 @@ class DrawingDotEnv(gym.Env):
     # -- rendering -----------------------------------------------------------------------
 
     def _get_obs(self) -> dict:
-        canvas = compose_canvas(self.ink, self.layout, self.canvas_size)
+        """
+        ⚠️ `observe_ink` decides whether the policy can see its own action history.
+
+        With `observe_ink=True` (the default, and how `dots_v1` was trained) channel 0 is the
+        accumulated ink -- which *is* the action history, rendered. That matters more than it looks:
+        `DiffusionUnetPolicy` keeps no state between action chunks (`reset()` only resets the obs
+        encoder), so every chunk is an independent draw conditioned on a 2-frame window. The ink is
+        therefore the ONLY place a manner can persist across an episode. Blanking channel 0 at
+        inference does not merely degrade the policy, it makes it lose commitment: mean final stroke
+        count goes 2.11 -> 6.44 as it switches between dragging and lifting motifs chunk to chunk.
+
+        That is an artifact of drawing, and it does not transfer. A robot sweeping long versus short
+        leaves no comparable trace in its observation, so a manner has to be carried by something
+        else -- which is exactly the job a steering signal would have to do. A steering method
+        validated here while the ink quietly does the remembering could fail on any task without a
+        visual memory.
+
+        With `observe_ink=False` channel 0 becomes `visited_mask`: discs at the dots already touched.
+        Task progress survives intact, the trajectory does not, and two rollouts that reached the
+        same dots by different routes become observationally identical. The env still accumulates
+        real ink either way -- scoring, `classify_manner`, `render()` and the recorded videos are all
+        unaffected, because they read `self.ink` directly rather than the observation.
+
+        One leak survives on purpose: `pen_pose` carries `z`, so the policy always knows its own
+        *current* contact state. That is not history, and a real robot knows its gripper state too.
+        """
+        history = (self.ink if self.observe_ink
+                   else visited_mask(self.layout, self.dots_visited, self.canvas_size))
+        canvas = compose_canvas(history, self.layout, self.canvas_size)
         dots = np.zeros((N_DOTS, 2), dtype=np.float32)
         dots[:self.layout.n_dots] = self.layout.dots.astype(np.float32)
         return {'canvas': canvas,

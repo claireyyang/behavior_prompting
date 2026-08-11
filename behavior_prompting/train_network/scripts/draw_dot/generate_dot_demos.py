@@ -99,9 +99,11 @@ def rollout_demo(env: DrawingDotEnv, layout, pen_start: np.ndarray,
 
 def generate(output: str, num_instances: int, repeats: int, base_seed: int,
              canvas_size: int, speed: float, noise_std: float,
-             strict: bool, verbose: bool) -> ReplayBuffer:
+             strict: bool, verbose: bool, observe_ink: bool = True) -> ReplayBuffer:
     rb = ReplayBuffer.create_empty_zarr(storage=zarr.MemoryStore())
-    env = DrawingDotEnv(canvas_size=canvas_size)
+    # `canvas` is recorded straight off the env, so this flag decides what the stored observations
+    # contain. A dataset built one way cannot train a policy rolled out the other way.
+    env = DrawingDotEnv(canvas_size=canvas_size, observe_ink=observe_ink)
     n_bad = 0
 
     for i in range(num_instances):
@@ -167,6 +169,9 @@ def main():
     p.add_argument('--overwrite', action='store_true')
     p.add_argument('--no-strict', dest='strict', action='store_false',
                    help='warn instead of failing when a demo misses a dot')
+    p.add_argument('--no-observe-ink', dest='observe_ink', action='store_false',
+                   help='observation channel 0 becomes visited-dot discs instead of the accumulated '
+                        'ink, removing the action history from the policy input')
     p.add_argument('--verbose', action='store_true')
     a = p.parse_args()
 
@@ -181,8 +186,10 @@ def main():
     print(f'Generating {a.num_instances} instances x {len(MANNERS)} manners x '
           f'{a.repeats_per_strategy} repeats = '
           f'{a.num_instances * len(MANNERS) * a.repeats_per_strategy} episodes')
+    print(f'observation channel 0: {"ink (action history)" if a.observe_ink else "visited dots"}')
     generate(a.output, a.num_instances, a.repeats_per_strategy, a.base_seed,
-             a.canvas_size, a.speed, a.noise_std, a.strict, a.verbose)
+             a.canvas_size, a.speed, a.noise_std, a.strict, a.verbose,
+             observe_ink=a.observe_ink)
     return 0
 
 

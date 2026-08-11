@@ -47,15 +47,22 @@ from behavior_prompting.train_network.utils.video_recorder import VideoRecorder
 
 
 def get_dot_env(shape_meta, n_train, n_test, fps, crf, exec_action_horizon, max_steps,
-                canvas_size=96, render_size=256, use_async_vector_env=True, **kwargs):
-    """Build the shared vector env. Mirrors `draw_runner.get_draw_env`; only the base env differs."""
+                canvas_size=96, render_size=256, observe_ink=True, use_async_vector_env=True,
+                **kwargs):
+    """
+    Build the shared vector env. Mirrors `draw_runner.get_draw_env`; only the base env differs.
+
+    `observe_ink` must match the dataset the policy was trained on -- it changes what channel 0 of
+    the observation contains, not just how it looks. See `DrawingDotEnv._get_obs`.
+    """
     n_envs = n_train + n_test
     max_obs_horizon = max(attr['horizon'] for attr in shape_meta['obs'].values())
 
     def env_fn():
         return MultiStepWrapper(
             VideoRecordingWrapper(
-                DrawingDotEnv(canvas_size=canvas_size, render_size=render_size),
+                DrawingDotEnv(canvas_size=canvas_size, render_size=render_size,
+                              observe_ink=observe_ink),
                 video_recoder=VideoRecorder.create_h264(
                     fps=fps, codec='h264', input_pix_fmt='rgb24', crf=crf,
                     thread_type='AUTO', thread_count=0),

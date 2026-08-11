@@ -264,6 +264,23 @@ def dot_mask(layout: DotLayout, size: int, radius: float = DOT_RADIUS) -> np.nda
     return mask
 
 
+def visited_mask(layout: DotLayout, dots_visited, size: int,
+                 radius: float = DOT_RADIUS) -> np.ndarray:
+    """
+    Filled discs at the dots already touched -- the alternative channel 0, see `compose_canvas`.
+
+    Deliberately the same discs `dot_mask` draws, just filtered, so channel 0 is exactly "which of
+    channel 1's dots are done". It reports *what has been accomplished* and nothing about *how*: two
+    rollouts that touched the same dots by completely different routes produce identical masks.
+    """
+    mask = np.zeros((size, size), dtype=np.uint8)
+    r = max(1, int(round(radius * (size - 1))))
+    for p, seen in zip(to_px(layout.dots, size), np.asarray(dots_visited, dtype=bool)):
+        if seen:
+            cv2.circle(mask, tuple(p), r, 1, -1, lineType=cv2.LINE_8)
+    return mask
+
+
 def wall_mask(layout: DotLayout, size: int) -> np.ndarray:
     """Observation channel 2. All-zero in v1; Phase 2 fills it from `layout.walls`."""
     mask = np.zeros((size, size), dtype=np.uint8)
@@ -275,14 +292,24 @@ def wall_mask(layout: DotLayout, size: int) -> np.ndarray:
     return mask
 
 
-def compose_canvas(ink: np.ndarray, layout: DotLayout, size: int) -> np.ndarray:
+def compose_canvas(history: np.ndarray, layout: DotLayout, size: int) -> np.ndarray:
     """
-    The `(3, size, size)` float32 observation: ch0 ink, ch1 dots, ch2 walls.
+    The `(3, size, size)` float32 observation: ch0 history, ch1 dots, ch2 walls.
 
     Three meaningful signals in the three channels a pretrained RGB encoder expects, rather than one
     replicated three times -- and Phase 2's walls slot into ch2 with no shape change.
+
+    Channel 0 is whatever the env chooses to expose about the past, and that choice is the whole
+    content of `DrawingDotEnv(observe_ink=...)`:
+
+      * `env.ink` -- the accumulated trace. This is the *rendered action history*, and because the
+        policy carries no state between action chunks it is the only place a manner can persist. See
+        the flag's docstring for why that is a problem worth being able to turn off.
+      * `visited_mask(...)` -- discs at the dots already touched. Same task progress, no trajectory.
+
+    The signature takes an array rather than the env so that the choice lives in exactly one place.
     """
-    return np.stack([ink.astype(np.float32),
+    return np.stack([history.astype(np.float32),
                      dot_mask(layout, size).astype(np.float32),
                      wall_mask(layout, size).astype(np.float32)], axis=0)
 
