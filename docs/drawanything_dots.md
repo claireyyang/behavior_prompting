@@ -519,6 +519,19 @@ Or press `d` mid-rollout in `interactive_rollout.py` to demonstrate and return t
 Keys: drag = draw · `space`/Enter finish · `r` restart · `l` new layout · `q` cancel. Then on the
 confirmation view: `s`/Enter save · `r` redo · `q` discard.
 
+The saved `.npz` feeds the motion-axis extractor in the sibling `fluency_steering` repo via
+`demo_processing/draw_dot_extract.py` (same ingest pattern as its MCAP and EgoDex paths): the **live**
+stream (`raw_xy`/`raw_z`/`raw_t`) becomes a planar `PoseTrack` preserving the human's pacing, with the
+pen `z` passed as a grounded contact channel — so the CONNECT-vs-TOUCH axis lands in the `contact_*`
+features. The canonical constant-speed stream is available there as the pacing-free control.
+
+```bash
+cd ../../fluency_steering   # adjust to your checkout
+python -m demo_processing.draw_dot_extract \
+  --data_root ../behavior_prompting/behavior_prompting/train_network/demos/draw_dot \
+  --out_dir analysis/draw_dot_tracks
+```
+
 > [!IMPORTANT]
 > **The demo is grounded on a freshly sampled layout, unrelated to the instance being steered.** This
 > supersedes the original plan in this section, which specified an *ungrounded* collector — blank

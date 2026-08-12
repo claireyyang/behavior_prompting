@@ -7,6 +7,9 @@
 		{
 			"name": "real-env",
 			"path": "../deps/real-env"
+		},
+		{
+			"path": "../../fluency_steering"
 		}
 	],
 	"settings": {
