@@ -17,3 +17,6 @@ profile_output*
 
 drawanything_sim_datasets/
 drawanything_sim_models/
+
+results/
+draw_dot/

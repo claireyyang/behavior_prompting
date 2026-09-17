@@ -10,6 +10,12 @@
 		},
 		{
 			"path": "../../fluency_steering"
+		},
+		{
+			"path": "../../../claire-yang/anzu"
+		},
+		{
+			"path": "../../../claire-y-yang/vla_foundry_internal"
 		}
 	],
 	"settings": {

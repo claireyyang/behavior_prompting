@@ -51,6 +51,8 @@ from behavior_prompting.train_network.env.draw_dot.layout import (
     MANNER_TO_ID,
     MANNERS,
     N_DOTS,
+    ORDER_INSTRUCTIONS,
+    ordered_layout,
     sample_layout,
     sample_pen_start,
 )
@@ -99,7 +101,8 @@ def rollout_demo(env: DrawingDotEnv, layout, pen_start: np.ndarray,
 
 def generate(output: str, num_instances: int, repeats: int, base_seed: int,
              canvas_size: int, speed: float, noise_std: float,
-             strict: bool, verbose: bool, observe_ink: bool = True) -> ReplayBuffer:
+             strict: bool, verbose: bool, observe_ink: bool = True,
+             order_tags: List[str] = ()) -> ReplayBuffer:
     rb = ReplayBuffer.create_empty_zarr(storage=zarr.MemoryStore())
     # `canvas` is recorded straight off the env, so this flag decides what the stored observations
     # contain. A dataset built one way cannot train a policy rolled out the other way.
@@ -115,9 +118,19 @@ def generate(output: str, num_instances: int, repeats: int, base_seed: int,
         for manner in MANNERS:
             for rep in range(repeats):
                 demo_rng = np.random.default_rng([base_seed, i, MANNER_TO_ID[manner], rep])
-                demo = ST.make_demo(manner, layout, pen_start, speed=speed,
+                if order_tags:
+                    # Composition dataset: the visit order is the "what", sampled independently
+                    # of the manner and carried ONLY by the language instruction (the tag rides
+                    # in the episode name; DotDataset maps tag -> phrase -> CLIP tokens). The
+                    # demo and the recorded rollout both follow the instructed order, so the
+                    # policy's supervision for the instruction is the behavior itself.
+                    tag = order_tags[int(demo_rng.integers(len(order_tags)))]
+                    layout_ep = ordered_layout(layout, tag)
+                else:
+                    tag, layout_ep = None, layout
+                demo = ST.make_demo(manner, layout_ep, pen_start, speed=speed,
                                     rng=demo_rng, noise_std=noise_std if rep > 0 else 0.0)
-                data = rollout_demo(env, layout, pen_start, demo)
+                data = rollout_demo(env, layout_ep, pen_start, demo)
                 T = len(data['action'])
 
                 # A demo that fails to touch every dot would poison the reference distribution the
@@ -136,10 +149,15 @@ def generate(output: str, num_instances: int, repeats: int, base_seed: int,
                     'strategy_id': np.full(T, MANNER_TO_ID[manner], dtype=np.float32),
                     'target_dot_index': demo.target_dot_index.astype(np.float32),
                 }
+                episode_name = f'{name}_{manner.lower()}_{rep}'
+                if tag is not None:
+                    labels['visit_order'] = np.repeat(
+                        layout_ep.order.astype(np.float32)[None], T, axis=0)
+                    episode_name = f'{episode_name}_{tag}'
                 rb.add_episode(
                     data=data,
                     tasks=[{'name': name, 'start_idx': 0, 'end_idx': T, 'labels': labels}],
-                    episode_name=f'{name}_{manner.lower()}_{rep}',
+                    episode_name=episode_name,
                 )
 
         if verbose and (i + 1) % 50 == 0:
@@ -172,6 +190,12 @@ def main():
     p.add_argument('--no-observe-ink', dest='observe_ink', action='store_false',
                    help='observation channel 0 becomes visited-dot discs instead of the accumulated '
                         'ink, removing the action history from the policy input')
+    p.add_argument('--order-instructions', nargs='+', default=None, metavar='TAG',
+                   choices=sorted(ORDER_INSTRUCTIONS),
+                   help='composition dataset: sample a visit-order instruction per episode from '
+                        'these tags (the "what" channel; tag rides in the episode name and is '
+                        'mapped to a language prompt at training time). Omit for the classic '
+                        'fixed left-to-right dataset.')
     p.add_argument('--verbose', action='store_true')
     a = p.parse_args()
 
@@ -187,9 +211,11 @@ def main():
           f'{a.repeats_per_strategy} repeats = '
           f'{a.num_instances * len(MANNERS) * a.repeats_per_strategy} episodes')
     print(f'observation channel 0: {"ink (action history)" if a.observe_ink else "visited dots"}')
+    if a.order_instructions:
+        print(f'visit-order instructions: {a.order_instructions}')
     generate(a.output, a.num_instances, a.repeats_per_strategy, a.base_seed,
              a.canvas_size, a.speed, a.noise_std, a.strict, a.verbose,
-             observe_ink=a.observe_ink)
+             observe_ink=a.observe_ink, order_tags=a.order_instructions or ())
     return 0
 
 

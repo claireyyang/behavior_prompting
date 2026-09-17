@@ -56,7 +56,8 @@ class DotDataset(BaseDataset):
                  action_padding: bool = True,
                  training_split_info: Optional[Dict[str, bool]] = None,
                  only_task_names: Optional[List[str]] = None,
-                 max_tasks: Optional[int] = None):
+                 max_tasks: Optional[int] = None,
+                 text_encoder_model_name: Optional[str] = None):
         assert dataset_path is not None or replay_buffer is not None, \
             'either dataset_path or replay_buffer must be provided'
 
@@ -83,10 +84,28 @@ class DotDataset(BaseDataset):
 
         rgb_keys, lowdim_keys = [], []
         for key, attr in shape_meta['obs'].items():
+            if attr.get('is_language', False):
+                continue        # not in the zarr; tokenized in __getitem__ from the episode name
             if attr.get('type', 'low_dim') == 'rgb' and attr.get('in_replay_buffer', True):
                 rgb_keys.append(key)
             elif attr.get('type', 'low_dim') == 'low_dim':
                 lowdim_keys.append(key)
+
+        # Language conditioning for the composition experiment: the order instruction ("the what")
+        # rides in the EPISODE NAME as a tag (see generate_dot_demos --order-instructions), is
+        # mapped to its natural-language phrase here, and is CLIP-tokenized per item -- the LIBERO
+        # pattern (libero_replay_image_dataset.py): no zarr field, no normalizer entry.
+        lang_attr = shape_meta['obs'].get('task_language')
+        self.using_language = (lang_attr is not None
+                               and not lang_attr.get('ignore_by_policy', True))
+        if self.using_language:
+            assert lang_attr['horizon'] == 1, 'task_language horizon must be 1'
+            assert text_encoder_model_name, \
+                'task_language is enabled but dataset.text_encoder_model_name is unset'
+            from transformers import CLIPTokenizer
+            self.clip_tokenizer = CLIPTokenizer.from_pretrained(text_encoder_model_name)
+        else:
+            self.clip_tokenizer = None
 
         self.shape_meta = shape_meta
         self.rgb_keys = rgb_keys
@@ -159,6 +178,20 @@ class DotDataset(BaseDataset):
 
         action = data.pop('action', None)
         metadata = data.pop('metadata', {})
+
+        if self.using_language:
+            from behavior_prompting.train_network.env.draw_dot.layout import ORDER_INSTRUCTIONS
+            name = str(self.replay_buffer.episode_names[int(metadata['episode_idx'])])
+            tag = name.rsplit('_', 1)[-1]
+            if tag not in ORDER_INSTRUCTIONS:
+                raise ValueError(
+                    f'episode {name!r} carries no order-instruction tag; the language policy '
+                    f'needs a dataset generated with generate_dot_demos.py --order-instructions')
+            tokens = self.clip_tokenizer(
+                ORDER_INSTRUCTIONS[tag][0], padding='max_length', truncation=True,
+                max_length=77, return_tensors='np')
+            data['task_language'] = tokens['input_ids'].astype(np.int64)  # (1, 77)
+
         torch_data = {'obs': dict_apply(data, torch.from_numpy), 'metadata': metadata}
         if action is not None:
             torch_data['action'] = torch.from_numpy(action.astype(np.float32))

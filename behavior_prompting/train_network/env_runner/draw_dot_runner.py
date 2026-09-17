@@ -122,6 +122,8 @@ class DrawDotRunner(BaseRunner):
                  render_size: int = 256,          # used by get_dot_env
                  fix_initial_state: bool = False,
                  strategy_coverage_threshold: float = DM.DEFAULT_COVERAGE_THRESHOLD,
+                 text_encoder_model_name: str = None,
+                 order_instruction: str = 'l2r',
                  **kwargs):
         super().__init__(output_dir)
         assert exec_action_horizon <= shape_meta['action']['horizon'], \
@@ -145,8 +147,34 @@ class DrawDotRunner(BaseRunner):
         self.fix_initial_state = fix_initial_state
         self.strategy_coverage_threshold = strategy_coverage_threshold
 
-        self.obs_horizons = {k: attr['horizon'] for k, attr in shape_meta['obs'].items()}
+        # Language keys never come from the env -- they are injected below, so keep them out of
+        # the env-obs slicing map.
+        self.obs_horizons = {k: attr['horizon'] for k, attr in shape_meta['obs'].items()
+                             if not attr.get('is_language', False)}
+
+        # Composition experiment: training-time eval runs under ONE fixed instruction (default
+        # 'l2r', the classic implicit order) so coverage and manner metrics stay comparable to the
+        # non-language runs; per-instruction compliance is steer_eval's job, not this runner's.
+        lang_attr = shape_meta['obs'].get('task_language')
+        self.using_language = (lang_attr is not None
+                               and not lang_attr.get('ignore_by_policy', True))
+        self.task_language_token_ids = None
+        if self.using_language:
+            assert text_encoder_model_name, \
+                'task_language is enabled but env_runner.text_encoder_model_name is unset'
+            from transformers import CLIPTokenizer
+            from behavior_prompting.train_network.env.draw_dot.layout import ORDER_INSTRUCTIONS
+            phrase = ORDER_INSTRUCTIONS[order_instruction][0]
+            tok = CLIPTokenizer.from_pretrained(text_encoder_model_name)
+            tokens = tok(phrase, padding='max_length', truncation=True, max_length=77,
+                         return_tensors='np')
+            self.task_language_token_ids = tokens['input_ids'].astype(np.int64)  # (1, 77)
+        self.order_instruction = order_instruction
+
         self.layout, self.recorded_pen_start = self._load_instance()
+        if self.using_language:
+            from behavior_prompting.train_network.env.draw_dot.layout import ordered_layout
+            self.layout = ordered_layout(self.layout, order_instruction)
         self.allowed = allowed_ink_mask(self.layout, canvas_size)
 
     def _load_instance(self):
@@ -216,6 +244,9 @@ class DrawDotRunner(BaseRunner):
         while not done:
             obs_dict = dict_apply(self._slice_obs(dict(obs)),
                                   lambda x: torch.from_numpy(x).to(device=device))
+            if self.task_language_token_ids is not None:
+                obs_dict['task_language'] = torch.from_numpy(
+                    np.tile(self.task_language_token_ids, (n_envs, 1, 1))).to(device=device)
             with torch.inference_mode():
                 action = policy.predict_action(obs_dict)['action']
             action = action.detach().to('cpu').numpy()[:, :self.exec_action_horizon]

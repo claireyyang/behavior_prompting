@@ -45,6 +45,10 @@ class RolloutResult:
     n_strokes: int
     manner: Optional[str] = None
     manner_ious: Dict[str, float] = field(default_factory=dict)
+    # First-touch order of dot indices (the "what" the rollout actually did). None when the caller
+    # had no trace; [] when nothing was touched. Compliance against an instructed order is the
+    # caller's comparison -- see `order_compliance`.
+    visit_order: Optional[List[int]] = None
 
     @property
     def contact_axis(self) -> Optional[str]:
@@ -55,6 +59,44 @@ class RolloutResult:
 
     def is_valid(self, coverage_threshold: float = DEFAULT_COVERAGE_THRESHOLD) -> bool:
         return self.dot_coverage >= coverage_threshold
+
+
+def first_touch_order(dot_trace: Sequence) -> List[int]:
+    """Visit order from the env's per-step `dot_trace`: first occurrence of each touched dot.
+
+    The raw trace repeats an index across a dwell and again on any re-visit; first-occurrence
+    de-dup makes it the order the task was DONE in, which is what an order instruction governs."""
+    seen: List[int] = []
+    for touched, _, _ in dot_trace:
+        if touched >= 0 and touched not in seen:
+            seen.append(int(touched))
+    return seen
+
+
+def order_compliance(visit_order: Optional[Sequence[int]],
+                     instructed: Sequence[int]) -> Dict[str, float]:
+    """How well a rollout's first-touch order matches the instructed order.
+
+    order_exact    1.0 iff the visited sequence IS the instructed permutation (all dots, right
+                   order); the headline compliance number.
+    order_kendall  normalized Kendall tau over the visited dots' instructed ranks, in [-1, 1]
+                   (1 = same order, -1 = reversed). Partial credit for near-misses; NaN when
+                   fewer than two dots were visited (no pair to order).
+    """
+    if visit_order is None:
+        return {'order_exact': float('nan'), 'order_kendall': float('nan')}
+    instructed = [int(i) for i in instructed]
+    visit = [int(v) for v in visit_order]
+    exact = float(visit == instructed)
+    rank = {d: r for r, d in enumerate(instructed)}
+    ranks = [rank[v] for v in visit if v in rank]
+    n = len(ranks)
+    if n < 2:
+        return {'order_exact': exact, 'order_kendall': float('nan')}
+    concordant = sum(1 for i in range(n) for j in range(i + 1, n) if ranks[i] < ranks[j])
+    n_pairs = n * (n - 1) // 2
+    return {'order_exact': exact,
+            'order_kendall': float((2.0 * concordant - n_pairs) / n_pairs)}
 
 
 def classify_manner(ink: np.ndarray, n_strokes: int, layout: DotLayout,
@@ -82,7 +124,8 @@ def classify_manner(ink: np.ndarray, n_strokes: int, layout: DotLayout,
 
 
 def evaluate_state(ink: np.ndarray, dots_visited: np.ndarray, n_strokes: int,
-                   layout: DotLayout, allowed: Optional[np.ndarray] = None) -> RolloutResult:
+                   layout: DotLayout, allowed: Optional[np.ndarray] = None,
+                   dot_trace: Optional[Sequence] = None) -> RolloutResult:
     """
     Score one rollout from its TERMINAL state.
 
@@ -107,13 +150,16 @@ def evaluate_state(ink: np.ndarray, dots_visited: np.ndarray, n_strokes: int,
 
     manner, ious = classify_manner(ink, n_strokes, layout, size)
     return RolloutResult(dot_coverage=coverage, ink_precision=precision,
-                         n_strokes=int(n_strokes), manner=manner, manner_ious=ious)
+                         n_strokes=int(n_strokes), manner=manner, manner_ious=ious,
+                         visit_order=(first_touch_order(dot_trace)
+                                      if dot_trace is not None else None))
 
 
 def evaluate_env(env, layout: Optional[DotLayout] = None) -> RolloutResult:
     """Convenience wrapper around `evaluate_state` for a local (non-vectorized) env."""
     layout = layout if layout is not None else env.layout
-    return evaluate_state(env.ink, env.dots_visited, env.n_strokes(), layout, env.allowed)
+    return evaluate_state(env.ink, env.dots_visited, env.n_strokes(), layout, env.allowed,
+                          dot_trace=env.dot_trace)
 
 
 def _normalized_entropy(counts: np.ndarray) -> float:

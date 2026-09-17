@@ -67,6 +67,20 @@ shape_meta: &shape_meta
       down_sample_steps: 1
       prompt_type: proprioception
       include_in_prompt_current_obs: true
+    # The order instruction ("the what" channel of the composition experiment). CLIP token IDs,
+    # tokenized at __getitem__ time from the episode name's order tag -- no zarr field, no
+    # normalizer entry (the LIBERO pattern). Off by default so the classic manner-only runs are
+    # untouched; draw_dot_policy_dunet_language.yaml flips ignore_by_policy.
+    task_language:
+      shape: [77]
+      type: low_dim
+      horizon: 1
+      is_language: true
+      in_replay_buffer: false
+      ignore_by_policy: true
+      prompt_type: ignore
+      include_in_prompt_current_obs: false
+      repeat_n_times: 8
 
 env_runner:
   _target_: behavior_prompting.train_network.env_runner.draw_dot_runner.DrawDotRunner
@@ -98,6 +112,11 @@ env_runner:
   # Manner metrics are computed over rollouts that essentially finished the drawing; an unfinished
   # one has a meaningless stroke structure.
   strategy_coverage_threshold: 0.9
+  # Language policy support: training-time eval runs under this ONE fixed instruction ('l2r' = the
+  # classic implicit order) so metrics stay comparable to non-language runs; per-instruction
+  # compliance is measured by steer_eval, not here.
+  text_encoder_model_name: ${oc.select:model.obs_encoder.text_encoder_model_name,null}
+  order_instruction: l2r
 
 # No augmentation. Cropping or colour-jittering would move the canvas relative to the dot
 # coordinates in `obs.dots` and change which manner a trajectory represents -- the one thing that
@@ -128,3 +147,5 @@ dataset:
   action_padding: true
   only_task_names: null
   max_tasks: null
+  # Tokenizer for task_language; null when the model has no text encoder (classic runs).
+  text_encoder_model_name: ${oc.select:model.obs_encoder.text_encoder_model_name,null}

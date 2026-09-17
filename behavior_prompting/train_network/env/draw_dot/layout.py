@@ -90,6 +90,7 @@ class DotLayout:
     """One instance of the task: where the dots are, and (Phase 2) where the walls are."""
     dots: np.ndarray                       # (N_DOTS, 2) scene frame
     walls: Optional[np.ndarray] = None     # (M, 2, 2) segments; None in v1
+    visit_order: Optional[np.ndarray] = None   # (N_DOTS,) permutation; None = left-to-right
 
     @property
     def n_dots(self) -> int:
@@ -98,15 +99,43 @@ class DotLayout:
     @property
     def order(self) -> np.ndarray:
         """
-        Visit order, fixed left-to-right for every manner.
+        Visit order. Defaults to left-to-right when `visit_order` is unset.
 
-        Order is deliberately NOT one of the manner axes: randomizing it would inject uncontrolled
-        multimodality on top of the manner variation and blur the mode structure being measured.
+        Order is deliberately NOT one of the manner axes: it is the task's "what", carried by the
+        LANGUAGE channel (an order instruction), never by the gesture. The composition experiment
+        varies it per episode via `visit_order`; everything manner-related is order-agnostic by
+        construction. Randomizing order WITHOUT conditioning the policy on an instruction would
+        inject uncontrolled multimodality and blur the mode structure being measured -- vary it
+        only together with the matching instruction prompt.
         """
+        if self.visit_order is not None:
+            return np.asarray(self.visit_order, dtype=np.int64)
         return np.argsort(self.dots[:, 0], kind='stable')
 
     def ordered_dots(self) -> np.ndarray:
         return self.dots[self.order]
+
+
+# The "what" instruction set: nameable, deterministic functions of the layout, so ground-truth
+# compliance is exact. Scene y is DOWN (see `to_px`), hence "top to bottom" sorts ascending y.
+# Tags are stored in episode names; phrases are what the policy's text encoder sees.
+ORDER_INSTRUCTIONS = {
+    'l2r': ('touch the dots from left to right',
+            lambda dots: np.argsort(dots[:, 0], kind='stable')),
+    'r2l': ('touch the dots from right to left',
+            lambda dots: np.argsort(-dots[:, 0], kind='stable')),
+    't2b': ('touch the dots from top to bottom',
+            lambda dots: np.argsort(dots[:, 1], kind='stable')),
+    'b2t': ('touch the dots from bottom to top',
+            lambda dots: np.argsort(-dots[:, 1], kind='stable')),
+}
+
+
+def ordered_layout(layout: DotLayout, tag: str) -> DotLayout:
+    """The same dots with the visit order a given instruction demands."""
+    _, fn = ORDER_INSTRUCTIONS[tag]
+    return DotLayout(dots=layout.dots, walls=layout.walls,
+                     visit_order=fn(layout.dots).astype(np.int64))
 
 
 # -- sampling ---------------------------------------------------------------------------

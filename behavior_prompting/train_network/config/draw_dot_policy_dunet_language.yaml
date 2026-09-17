@@ -1,0 +1,78 @@
+# Language-conditioned Diffusion-UNet policy on DrawingDotEnv: the composition experiment's policy.
+#
+# Language carries the WHAT (a dot visit-order instruction, tokenized from the episode name's order
+# tag); the gesture-derived steering signal carries the HOW (manner) at inference. The prompt never
+# contains manner words -- that separation is the experiment.
+#
+#   accelerate launch --gpu_ids 0,1,2,3 --num_processes=4 train.py \
+#     --config-name=draw_dot_policy_dunet_language \
+#     task.dataset.dataset_path=datasets/draw_dot/dots_order_train.zarr \
+#     task.eval_dataset_path=datasets/draw_dot/dots_order_eval.zarr
+#
+# The dataset MUST be generated with generate_dot_demos.py --order-instructions (DotDataset raises
+# on episodes without an order tag). Everything except the language switch mirrors
+# draw_dot_policy_dunet.yaml -- see the rationale comments there (ResNet choice, checkpointing).
+
+defaults:
+  - policy_base
+  - task: draw_dot
+  - model: diffusion_unet
+  - _self_
+
+task:
+  shape_meta:
+    obs:
+      task_language:
+        ignore_by_policy: false
+
+model:
+  obs_encoder:
+    model_name: 'resnet34.a1_in1k'
+    downsample_ratio: 16
+    feature_aggregation: 'avg'
+
+checkpoint:
+  save_last_ckpt: false
+  save_last_snapshot: false
+  topk:
+    monitor_key: eval_test_mean_score
+    format_str: epoch={epoch:04d}-${.monitor_key}={${.monitor_key}:.3f}.ckpt
+    k: 1
+    mode: max
+  save_train_loss_ckpt_every: 5
+
+dataloader:
+  # The in-graph CLIP text encoder adds memory; smaller batch than the classic config.
+  batch_size: 48
+  num_workers: 8
+  persistent_workers: true
+  pin_memory: true
+  shuffle: true
+
+val_dataloader:
+  batch_size: 48
+  num_workers: 8
+  persistent_workers: false
+  pin_memory: true
+  shuffle: false
+
+optimizer:
+  lr: 1.0e-4
+  betas: [0.95, 0.999]
+  eps: 1.0e-8
+  weight_decay: 1.0e-6
+
+training:
+  gradient_accumulate_every: 1
+  lr_scheduler: cosine
+  lr_warmup_proportion: 0.05
+  num_epochs: 60
+  rollout_every: 10
+  sample_every: 5
+  val_every: 5
+  use_ema: true
+  freeze_encoder: false
+  mixed_precision: 'no'
+  clip_grad_norm: 1.5
+  rollout:
+    intermediate_max_tasks: 10
